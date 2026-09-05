@@ -180,6 +180,19 @@
       font-size: 12px; cursor: pointer; font-weight: 600;
     }
     button.link:hover { text-decoration: underline; }
+    button.link.danger { color: var(--bad); }
+    button.link.danger:hover { text-decoration: underline; }
+
+    /* Toast notification for user feedback */
+    #toast {
+      position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%);
+      background: var(--good); color: #fff; padding: 8px 16px;
+      border-radius: 999px; font-size: 12px; font-weight: 600;
+      opacity: 0; transition: opacity 0.25s ease, transform 0.25s ease;
+      pointer-events: none; z-index: 1000; white-space: nowrap;
+    }
+    #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+    #toast.hide { opacity: 0; transform: translateX(-50%) translateY(10px); }
   </style>
 </head>
 <body>
@@ -249,7 +262,11 @@
     <button id="btnOpenAmazon" class="link" type="button">Open Amazon results</button>
     <button id="btnOpenEbay" class="link" type="button">Open eBay results</button>
     <span>· Estimates only — excludes shipping, returns, taxes &amp; ad costs.</span>
+    <button id="btnReset" class="link danger" type="button" title="Clear all stored comparison history and cached data">Reset Data</button>
   </footer>
+
+  <!-- Toast notification element -->
+  <div id="toast" class="hide">Data cleared!</div>
 
   <script src="popup.js"></script>
 </body>
