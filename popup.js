@@ -35,7 +35,9 @@ const els = {
   emptyState: $('emptyState'),
   readyHint: $('readyHint'),
   openAmazon: $('btnOpenAmazon'),
-  openEbay: $('btnOpenEbay')
+  openEbay: $('btnOpenEbay'),
+  reset: $('btnReset'),
+  toast: $('toast')
 };
 
 const fmtUSD = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
@@ -462,6 +464,64 @@ async function openResults(site) {
   catch (_) { /* ignore */ }
 }
 
+/** Reset all stored data and UI state back to pristine defaults. */
+async function resetData() {
+  // Clear all chrome.storage.local keys (comparison history, cached results, fee prefs, etc.)
+  try {
+    await chrome.storage.local.clear();
+  } catch (e) {
+    console.error('[popup] Failed to clear storage:', e);
+  }
+
+  // Reset local state reference
+  state = null;
+
+  // Hide all dynamic UI sections
+  els.progressBox.classList.add('hidden');
+  els.resultsBox.classList.add('hidden');
+  els.banner.classList.add('hidden');
+  els.readyHint.classList.remove('hidden');
+
+  // Clear input fields
+  els.q.value = '';
+  els.feeRate.value = '13'; // default fee rate
+
+  // Reset chips to idle state
+  els.chipAmazon.classList.remove('busy', 'done', 'err');
+  els.chipEbay.classList.remove('busy', 'done', 'err');
+  els.chipAmazon.querySelector('.lbl').textContent = 'Amazon: waiting';
+  els.chipEbay.querySelector('.lbl').textContent = 'eBay: waiting';
+
+  // Clear table rows and summary
+  els.rows.innerHTML = '';
+  els.summary.textContent = '';
+  els.emptyState.classList.add('hidden');
+
+  // Reset sort order to default
+  sort = { key: 'profit', dir: 'desc' };
+  markSortHeader();
+
+  // Re-enable compare button
+  els.compare.disabled = false;
+  els.retry.classList.add('hidden');
+
+  // Stop any running ticker
+  stopTicker();
+
+  // Show success toast
+  showToast();
+}
+
+/** Display a temporary success toast notification. */
+function showToast() {
+  els.toast.classList.remove('hide');
+  els.toast.classList.add('show');
+  setTimeout(() => {
+    els.toast.classList.remove('show');
+    els.toast.classList.add('hide');
+  }, 2000);
+}
+
 function rerenderFromConfig() {
   if (!state || state.phase !== 'done') return;
   if (!(sort.key === 'profit' || sort.key === 'margin' || sort.key === 'fees')) {
@@ -486,6 +546,7 @@ function init() {
   els.retry.addEventListener('click', forceParse);
   els.openAmazon.addEventListener('click', () => openResults('amazon'));
   els.openEbay.addEventListener('click', () => openResults('ebay'));
+  els.reset.addEventListener('click', resetData);
 
   els.feeRate.addEventListener('change', () => {
     chrome.storage.local.set({ feeRate: els.feeRate.value }).catch(() => {});
