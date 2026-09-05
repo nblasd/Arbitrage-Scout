@@ -766,18 +766,39 @@ function sleepPaced(ms, run) {
         'a[class*="s-item__link"]',
         // NEW: Additional patterns for modern layouts
         'div.s-item a[href*="/itm/"]',
-        'article.s-item a[href]'
+        'article.s-item a[href]',
+        // Fallback: any anchor in the node with /itm/ href
+        'a[href]'
       ];
       
       let anchor = null;
       for (const selector of anchorSelectors) {
         anchor = node.querySelector(selector);
-        if (anchor) break;
+        if (anchor && anchor.href && anchor.href.includes('/itm/')) break;
       }
-      if (!anchor) { warn('No anchor found in eBay container'); return null; }
+      
+      // Last resort: scan all anchors in node for /itm/ pattern
+      if (!anchor || !anchor.href || !anchor.href.includes('/itm/')) {
+        const allAnchors = node.querySelectorAll('a[href]');
+        for (const a of allAnchors) {
+          if (a.href && a.href.includes('/itm/')) {
+            anchor = a;
+            log('eBay anchor found via full scan fallback');
+            break;
+          }
+        }
+      }
+      
+      if (!anchor) { 
+        log('eBay container has no valid anchor, checking node structure:', node.tagName, node.className);
+        return null; 
+      }
       
       const idMatch = anchor.href.match(/\/itm\/(\d{9,})/);
-      if (!idMatch) return null;
+      if (!idMatch) {
+        log('eBay anchor href does not contain valid item ID:', anchor.href);
+        return null;
+      }
       const id = idMatch[1];
 
       const titleSelectors = [
@@ -788,15 +809,27 @@ function sleepPaced(ms, run) {
         '.s-item__title-text',
         // NEW: Additional title patterns
         'div.s-item__title h3',
-        '[data-testid="listing-title"]'
+        '[data-testid="listing-title"]',
+        // Fallback: any heading element
+        'h1, h2, h3, h4, h5, h6'
       ];
       let titleEl = null;
       for (const selector of titleSelectors) {
         titleEl = node.querySelector(selector);
         if (titleEl && titleEl.textContent.trim().length > 3) break;
       }
+      
+      // Fallback: use anchor text if no title element found
+      if (!titleEl) {
+        titleEl = anchor;
+        log('eBay title using anchor text as fallback');
+      }
+      
       const title = cleanEbayTitle(titleEl ? titleEl.textContent : anchor.title || '');
-      if (!title) { warn('No valid title for eBay item'); return null; }
+      if (!title) { 
+        warn('No valid title for eBay item, anchor text:', anchor.textContent.slice(0, 100));
+        return null; 
+      }
 
       const priceSelectors = [
         '.s-item__price',
@@ -806,7 +839,9 @@ function sleepPaced(ms, run) {
         // NEW: Additional price patterns
         '.s-item__detail .s-item__price',
         'div[data-testid="item-price"]',
-        '.price-display'
+        '.price-display',
+        // Fallback: any span/div with $ symbol
+        'span, div'
       ];
       let price = null;
       let matchedPriceSel = null;
@@ -814,16 +849,27 @@ function sleepPaced(ms, run) {
         const priceEl = node.querySelector(selector);
         if (priceEl) {
           price = parseEbayPrice(priceEl.textContent);
-          if (price != null) { matchedPriceSel = selector; break; }
+          if (price != null) { 
+            matchedPriceSel = selector; 
+            break; 
+          }
         }
       }
       if (matchedPriceSel) { log(`eBay price found via: ${matchedPriceSel}`); }
-      // Last resort: scan the card text for a $ amount.
+      
+      // Last resort: scan the entire card text for a $ amount.
       if (price == null) {
-        const t = (node.innerText || '').slice(0, 500);
-        if (/\$/.test(t) && !/[£€]/.test(t)) price = parseEbayPrice(t);
+        const t = (node.innerText || '').slice(0, 800);
+        if (/\$/.test(t) && !/[£€]/.test(t)) {
+          price = parseEbayPrice(t);
+          if (price != null) log('eBay price extracted from full card text scan');
+        }
       }
-      if (price == null) { warn('No valid price for eBay item:', title); return null; }
+      
+      if (price == null) { 
+        warn('No valid price for eBay item:', title.slice(0, 80)); 
+        return null; 
+      }
 
       const condSelectors = [
         '.s-item__condition',
@@ -852,7 +898,10 @@ function sleepPaced(ms, run) {
         rating: null,
         condition: condEl ? condEl.textContent.replace(/\s+/g, ' ').trim().slice(0, 60) : ''
       };
-    } catch (e) { warn('parseEbayNode error:', e.message); return null; }
+    } catch (e) { 
+      warn('parseEbayNode error:', e.message, 'node:', node.tagName); 
+      return null; 
+    }
   }
 
   function ebayContainers() {
@@ -886,7 +935,36 @@ function sleepPaced(ms, run) {
       byId.set(m[1], wrap);
     });
     log(`eBay anchor fallback found ${byId.size} unique item IDs`);
-    return Array.from(byId.values());
+    
+    // If we found anchors but wrappers are too generic, try to expand the container
+    if (byId.size > 0) {
+      return Array.from(byId.values());
+    }
+    
+    // Strategy F: Last resort - find any element containing an /itm/ link
+    const lastResort = [];
+    document.querySelectorAll('a[href*="/itm/"]').forEach((a) => {
+      const m = a.href.match(/\/itm\/(\d{9,})/);
+      if (!m) return;
+      const id = m[1];
+      if (lastResort.some(n => n.dataset && n.dataset.ebayId === id)) return;
+      
+      // Find the closest reasonable container
+      let container = a.closest('ul, ol, div[class*="list"], div[class*="grid"], section, main');
+      if (!container) container = a.parentElement;
+      if (!container) return;
+      
+      // Mark it to avoid duplicates
+      container.dataset.ebayId = id;
+      lastResort.push(container);
+    });
+    
+    if (lastResort.length > 0) {
+      log(`eBay last-resort container scan found ${lastResort.length} items`);
+      return lastResort;
+    }
+    
+    return [];
   }
 
   function extractEbay() {
