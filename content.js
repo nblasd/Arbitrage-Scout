@@ -251,7 +251,12 @@ function sleepPaced(ms, run) {
       'div[data-csa-c-type="item"]',
       'div[data-component-type="s-product-image"]',
       '.s-result-list .s-result-item',
-      '[data-cel-widget*="search_result"]'
+      '[data-cel-widget*="search_result"]',
+      // NEW: Additional modern selectors for 2024-2025 layouts
+      'div.s-result-item[data-cy="asin-title"]',
+      'div.a-section.s-result-card',
+      'div[data-uuid]',  // Amazon's newer UUID-based containers
+      'article[data-asin]'  // Semantic HTML adoption
     ];
 
     const present = () => {
@@ -260,6 +265,12 @@ function sleepPaced(ms, run) {
           log('Grid detected via selector:', sel);
           return true;
         }
+      }
+      // Fallback: check if we have ANY product links even without proper containers
+      const productLinks = document.querySelectorAll('a[href*="/dp/"], a[href*="/gp/product/"], a[href*="/sspa/click/"]');
+      if (productLinks.length >= 3) {
+        log('Grid detection: Found', productLinks.length, 'product links without standard containers');
+        return true;
       }
       return false;
     };
@@ -271,6 +282,7 @@ function sleepPaced(ms, run) {
 
     return new Promise((resolve) => {
       let done = false;
+      let mutationCount = 0;
       const finish = (ok) => {
         if (done) return;
         done = true;
@@ -278,14 +290,17 @@ function sleepPaced(ms, run) {
         clearTimeout(giveUp);
         resolve(ok);
       };
-      const obs = new MutationObserver(() => {
+      const obs = new MutationObserver((mutations) => {
         if (!isCurrent(run)) return finish(false);
-        if (present()) finish(true);
+        mutationCount += mutations.length;
+        // Check every few mutations to reduce overhead
+        if (mutationCount % 3 === 0 && present()) finish(true);
       });
-      obs.observe(document.documentElement, { childList: true, subtree: true });
+      obs.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
       const giveUp = setTimeout(() => {
-        warn('Grid wait timeout - no product containers found');
-        finish(false);
+        warn('Grid wait timeout - checking for partial render...');
+        // Final check: even if timeout, if we found some elements, proceed
+        finish(present());
       }, CFG.gridWaitMs);
     });
   }
@@ -301,7 +316,11 @@ function sleepPaced(ms, run) {
           'div[data-component-type="s-search-result"]',
           'div.s-result-item[data-asin]',
           'div[data-asin][data-index]:not([data-index=""])',
-          'div[data-csa-c-type="item"][data-asin]'
+          'div[data-csa-c-type="item"][data-asin]',
+          // NEW: Additional modern selectors
+          'div.s-result-item[data-cy="asin-title"]',
+          'div.a-section.s-result-card[data-asin]',
+          'article[data-asin]'
         ]
       },
       // Group 2: Sponsored / Ad results
@@ -311,7 +330,10 @@ function sleepPaced(ms, run) {
           'div[data-asin].AdHolder',
           'div[data-asin][data-component-type="sp-sponsored-result"]',
           'div.s-result-item[data-asin].AdHolder',
-          'div[data-component-type="s-sponsored-result"]'
+          'div[data-component-type="s-sponsored-result"]',
+          // NEW: More sponsored patterns
+          'div[data-asin][data-ad-id]',
+          '[data-cy="ad-badge"]'
         ]
       },
       // Group 3: Grid column layouts
@@ -320,7 +342,10 @@ function sleepPaced(ms, run) {
         selectors: [
           'div.sg-col[data-asin]',
           'div[class*="sg-col-"][data-asin]',
-          'div.a-section[data-asin][data-index]'
+          'div.a-section[data-asin][data-index]',
+          // NEW: Additional column patterns
+          'div.sg-row div[data-asin]',
+          '.s-desktop-content div[data-asin]'
         ]
       },
       // Group 4: List/item layouts
@@ -328,7 +353,9 @@ function sleepPaced(ms, run) {
         name: 'list-item',
         selectors: [
           'li[data-asin]',
-          'li.s-result-item[data-asin]'
+          'li.s-result-item[data-asin]',
+          // NEW: Semantic HTML patterns
+          'article.s-result-item'
         ]
       },
       // Group 5: Cel widget based (Amazon's internal widget system)
@@ -336,7 +363,18 @@ function sleepPaced(ms, run) {
         name: 'cel-widget',
         selectors: [
           '[data-cel-widget*="search_result_"]',
-          '[data-cel-widget*="search-result"]'
+          '[data-cel-widget*="search-result"]',
+          // NEW: UUID-based containers
+          'div[data-uuid][data-asin]'
+        ]
+      },
+      // Group 6: Data attribute fallbacks (when class names change)
+      {
+        name: 'data-attr-fallback',
+        selectors: [
+          '[data-asin]:not([data-asin=""])',
+          '[data-index][data-asin]',
+          '[data-cy="asin-title"]'
         ]
       }
     ];
@@ -380,15 +418,18 @@ function sleepPaced(ms, run) {
     const anchorSelectors = [
       'a[href*="/dp/"]',
       'a[href*="/gp/product/"]',
-      'a[href*="/sspa/click/"]'
+      'a[href*="/sspa/click/"]',
+      // NEW: aria-label based anchors (accessibility pattern)
+      'a[aria-label*="product"][href]'
     ];
 
     for (const anchorSel of anchorSelectors) {
       document.querySelectorAll(anchorSel).forEach((a) => {
         const asin = extractAsin(a.href);
         if (!asin || byAsin.has(asin)) return;
+        // Try multiple wrapper patterns with increasing specificity
         const wrap = a.closest(
-          'div[data-component-type="s-search-result"], div.s-result-item, div[data-asin][data-index], div[data-asin], div[class*="sg-col"], div.a-section, li, [data-cel-widget*="search"]'
+          'div[data-component-type="s-search-result"], div.s-result-item, div[data-asin][data-index], div[data-asin], div[class*="sg-col"], div.a-section, li, [data-cel-widget*="search"], article[data-asin], div[data-uuid]'
         ) || a;
         byAsin.set(asin, wrap);
       });
@@ -588,6 +629,64 @@ function sleepPaced(ms, run) {
 /* ------------------------------------------------------------------ *
  * EBAY extraction
  * ------------------------------------------------------------------ */
+
+  /** Wait for eBay results grid to render (bounded, like Amazon). */
+  function waitEbayGrid(run) {
+    const gridSelectors = [
+      'li.s-item',
+      'div.s-card',
+      'ul.srp-results li',
+      '.s-item__wrapper',
+      // NEW: Additional modern selectors for 2024-2025 layouts
+      'div[data-testid="search-result"]',
+      'article.s-item',
+      'div[class*="srp-grid"]'
+    ];
+
+    const present = () => {
+      for (const sel of gridSelectors) {
+        if (document.querySelector(sel)) {
+          log('eBay grid detected via selector:', sel);
+          return true;
+        }
+      }
+      // Fallback: check for any product links
+      const productLinks = document.querySelectorAll('a[href*="/itm/"]');
+      if (productLinks.length >= 3) {
+        log('eBay grid detection: Found', productLinks.length, 'product links without standard containers');
+        return true;
+      }
+      return false;
+    };
+
+    if (present()) return Promise.resolve(true);
+    if (isBlockedPage()) return Promise.resolve(false);
+
+    log('Waiting for eBay grid to render...', { timeoutMs: CFG.gridWaitMs });
+
+    return new Promise((resolve) => {
+      let done = false;
+      let mutationCount = 0;
+      const finish = (ok) => {
+        if (done) return;
+        done = true;
+        obs.disconnect();
+        clearTimeout(giveUp);
+        resolve(ok);
+      };
+      const obs = new MutationObserver((mutations) => {
+        if (!isCurrent(run)) return finish(false);
+        mutationCount += mutations.length;
+        if (mutationCount % 3 === 0 && present()) finish(true);
+      });
+      obs.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+      const giveUp = setTimeout(() => {
+        warn('eBay grid wait timeout - checking for partial render...');
+        finish(present());
+      }, CFG.gridWaitMs);
+    });
+  }
+
   function cleanEbayTitle(t) {
     let s = (t || '').replace(/\s+/g, ' ').trim();
     // Strip eBay list chrome prefixes ("New Listing", "Results for ...", ...)
@@ -630,8 +729,23 @@ function sleepPaced(ms, run) {
 
   function parseEbayNode(node) {
     try {
-      const anchor = node.querySelector('a.s-item__link[href], a[href*="/itm/"]');
-      if (!anchor) return null;
+      // Multiple anchor selector strategies for eBay
+      const anchorSelectors = [
+        'a.s-item__link[href]',
+        'a[href*="/itm/"]',
+        'a[class*="s-item__link"]',
+        // NEW: Additional patterns for modern layouts
+        'div.s-item a[href*="/itm/"]',
+        'article.s-item a[href]'
+      ];
+      
+      let anchor = null;
+      for (const selector of anchorSelectors) {
+        anchor = node.querySelector(selector);
+        if (anchor) break;
+      }
+      if (!anchor) { warn('No anchor found in eBay container'); return null; }
+      
       const idMatch = anchor.href.match(/\/itm\/(\d{9,})/);
       if (!idMatch) return null;
       const id = idMatch[1];
@@ -641,7 +755,10 @@ function sleepPaced(ms, run) {
         '.s-item__title span',
         'h3.s-item__title',
         'span[role="heading"]',
-        '.s-item__title-text'
+        '.s-item__title-text',
+        // NEW: Additional title patterns
+        'div.s-item__title h3',
+        '[data-testid="listing-title"]'
       ];
       let titleEl = null;
       for (const selector of titleSelectors) {
@@ -649,35 +766,44 @@ function sleepPaced(ms, run) {
         if (titleEl && titleEl.textContent.trim().length > 3) break;
       }
       const title = cleanEbayTitle(titleEl ? titleEl.textContent : anchor.title || '');
-      if (!title) return null;
+      if (!title) { warn('No valid title for eBay item'); return null; }
 
       const priceSelectors = [
         '.s-item__price',
         'span[class*="price"]',
         '.x-price-primary',
-        '.s-item__detail--primary span'
+        '.s-item__detail--primary span',
+        // NEW: Additional price patterns
+        '.s-item__detail .s-item__price',
+        'div[data-testid="item-price"]',
+        '.price-display'
       ];
       let price = null;
+      let matchedPriceSel = null;
       for (const selector of priceSelectors) {
         const priceEl = node.querySelector(selector);
         if (priceEl) {
           price = parseEbayPrice(priceEl.textContent);
-          if (price != null) break;
+          if (price != null) { matchedPriceSel = selector; break; }
         }
       }
+      if (matchedPriceSel) { log(`eBay price found via: ${matchedPriceSel}`); }
       // Last resort: scan the card text for a $ amount.
       if (price == null) {
         const t = (node.innerText || '').slice(0, 500);
         if (/\$/.test(t) && !/[£€]/.test(t)) price = parseEbayPrice(t);
       }
-      if (price == null) return null;
+      if (price == null) { warn('No valid price for eBay item:', title); return null; }
 
       const condSelectors = [
         '.s-item__condition',
         '.s-item__subtitle',
         'span.SECONDARY_INFO',
         '.s-item__condition-text',
-        '.x-item-condition'
+        '.x-item-condition',
+        // NEW: Additional condition patterns
+        'div[itemprop="itemCondition"]',
+        '[data-testid="item-condition"]'
       ];
       let condEl = null;
       for (const selector of condSelectors) {
@@ -696,7 +822,7 @@ function sleepPaced(ms, run) {
         rating: null,
         condition: condEl ? condEl.textContent.replace(/\s+/g, ' ').trim().slice(0, 60) : ''
       };
-    } catch (_) { return null; }
+    } catch (e) { warn('parseEbayNode error:', e.message); return null; }
   }
 
   function ebayContainers() {
@@ -710,14 +836,26 @@ function sleepPaced(ms, run) {
       .filter((n) => n.querySelector('a[href*="/itm/"]'));
     if (nodes.length >= 3) return nodes;
 
-    // Strategy C: generic anchor-based fallback (layout fully changed).
+    // Strategy C: data-testid based containers (modern eBay).
+    nodes = Array.from(document.querySelectorAll('div[data-testid="search-result"], article.s-item'))
+      .filter((n) => n.querySelector('a[href*="/itm/"]'));
+    if (nodes.length >= 3) return nodes;
+
+    // Strategy D: wrapper-based selection.
+    nodes = Array.from(document.querySelectorAll('.s-item__wrapper, div.s-item'))
+      .filter((n) => n.querySelector('a[href*="/itm/"]'));
+    if (nodes.length >= 2) return nodes;
+
+    // Strategy E: generic anchor-based fallback (layout fully changed).
     const byId = new Map();
     document.querySelectorAll('a[href*="/itm/"]').forEach((a) => {
       const m = a.href.match(/\/itm\/(\d{9,})/);
       if (!m || byId.has(m[1])) return;
-      const wrap = a.closest('li, div[class*="s-card"], div[class*="s-item"], div[class*="srp"], div.s-item__wrapper') || a;
+      // Try multiple wrapper patterns with increasing specificity
+      const wrap = a.closest('li, div[class*="s-card"], div[class*="s-item"], div[class*="srp"], div.s-item__wrapper, article.s-item, div[data-testid="search-result"]') || a;
       byId.set(m[1], wrap);
     });
+    log(`eBay anchor fallback found ${byId.size} unique item IDs`);
     return Array.from(byId.values());
   }
 
@@ -795,8 +933,18 @@ function sleepPaced(ms, run) {
             report(run, { error: 'no-results' });
           } else {
             // Page loaded but grid didn't appear - likely layout change or partial load
-            report(run, { error: 'no-results' });
+            report(run, { error: 'parse-failed' });
           }
+          return;
+        }
+      }
+      // eBay also benefits from bounded grid wait
+      if (SITE === 'ebay') {
+        const gridReady = await waitEbayGrid(run);
+        if (!isCurrent(run)) return;
+        if (isBlockedPage()) { report(run, { error: 'blocked' }); return; }
+        if (!gridReady) {
+          report(run, { error: 'parse-failed' });
           return;
         }
       }
@@ -816,7 +964,13 @@ function sleepPaced(ms, run) {
             report(run, { error: 'no-results' });
           }
         } else {
-          report(run, { error: 'no-results' });
+          // For eBay, check if product links exist but parsing failed
+          const hasProductLinks = document.querySelectorAll('a[href*="/itm/"]').length > 0;
+          if (hasProductLinks) {
+            report(run, { error: 'parse-failed' });
+          } else {
+            report(run, { error: 'no-results' });
+          }
         }
         return;
       }
