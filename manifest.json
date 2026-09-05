@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Arbitrage Scout — Amazon ⇄ eBay Comparator",
+  "short_name": "Arbitrage Scout",
+  "version": "1.0.0",
+  "description": "Searches the same product on Amazon and eBay, matches similar listings, and estimates resale profit after marketplace fees.",
+  "minimum_chrome_version": "102",
+  "permissions": [
+    "storage",
+    "tabs",
+    "alarms",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://www.amazon.com/*",
+    "https://www.ebay.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Arbitrage Scout",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.amazon.com/*",
+        "https://www.ebay.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
