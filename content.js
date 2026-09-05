@@ -48,24 +48,24 @@
  * ------------------------------------------------------------------ */
 const CFG = {
   // HARD ceiling for the whole scrape (pacing + scrolling + parsing).
-  // Everything is raced against this deadline; a run can never outlive it.
-  scrapeDeadlineMs: 15000,
+  // Increased from 15s to 25s to allow more time for dynamic content rendering.
+  scrapeDeadlineMs: 25000,
   // Max extra time to wait for Amazon's lazy/client-rendered result grid,
-  // once the page looks alive. Bounded — never an unbounded observer.
-  gridWaitMs: 12000,
+  // once the page looks alive. Increased from 12s to 18s for slower connections.
+  gridWaitMs: 18000,
   // Random pre-parse wait (ms) — mimics a person reading the page first.
   // SKIPPED entirely when the tab is hidden/backgrounded (a background tab
   // would otherwise sit through the full pacing delay before reporting).
-  preParseMinMs: 500,
-  preParseMaxMs: 1500,
+  preParseMinMs: 300,
+  preParseMaxMs: 900,
   // Pauses between parsing steps (ms).
-  pauseMinMs: 100,
-  pauseMaxMs: 300,
+  pauseMinMs: 80,
+  pauseMaxMs: 200,
   // Scroll simulation parameters.
-  scrollMinPx: 300,
-  scrollMaxPx: 700,
-  scrollStepsMin: 3,
-  scrollStepsMax: 5,
+  scrollMinPx: 200,
+  scrollMaxPx: 500,
+  scrollStepsMin: 2,
+  scrollStepsMax: 4,
   // Max items reported per site.
   maxItems: { amazon: 50, ebay: 80 }
 };
@@ -283,20 +283,35 @@ function sleepPaced(ms, run) {
     return new Promise((resolve) => {
       let done = false;
       let mutationCount = 0;
+      let checkInterval = null;
       const finish = (ok) => {
         if (done) return;
         done = true;
         obs.disconnect();
         clearTimeout(giveUp);
+        if (checkInterval) clearInterval(checkInterval);
         resolve(ok);
       };
       const obs = new MutationObserver((mutations) => {
         if (!isCurrent(run)) return finish(false);
         mutationCount += mutations.length;
         // Check every few mutations to reduce overhead
-        if (mutationCount % 3 === 0 && present()) finish(true);
+        if (mutationCount % 2 === 0 && present()) finish(true);
       });
       obs.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+      
+      // Fallback: periodic check in case mutations don't trigger (e.g., JS replacing innerHTML)
+      let fallbackChecks = 0;
+      checkInterval = setInterval(() => {
+        if (!isCurrent(run)) return finish(false);
+        fallbackChecks++;
+        if (present()) finish(true);
+        // Stop checking after 80% of timeout to avoid race with giveUp
+        if (fallbackChecks >= Math.floor(CFG.gridWaitMs / 500) - 1) {
+          clearInterval(checkInterval);
+        }
+      }, 500);
+      
       const giveUp = setTimeout(() => {
         warn('Grid wait timeout - checking for partial render...');
         // Final check: even if timeout, if we found some elements, proceed
@@ -667,19 +682,34 @@ function sleepPaced(ms, run) {
     return new Promise((resolve) => {
       let done = false;
       let mutationCount = 0;
+      let checkInterval = null;
       const finish = (ok) => {
         if (done) return;
         done = true;
         obs.disconnect();
         clearTimeout(giveUp);
+        if (checkInterval) clearInterval(checkInterval);
         resolve(ok);
       };
       const obs = new MutationObserver((mutations) => {
         if (!isCurrent(run)) return finish(false);
         mutationCount += mutations.length;
-        if (mutationCount % 3 === 0 && present()) finish(true);
+        if (mutationCount % 2 === 0 && present()) finish(true);
       });
       obs.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+      
+      // Fallback: periodic check in case mutations don't trigger (e.g., JS replacing innerHTML)
+      let fallbackChecks = 0;
+      checkInterval = setInterval(() => {
+        if (!isCurrent(run)) return finish(false);
+        fallbackChecks++;
+        if (present()) finish(true);
+        // Stop checking after 80% of timeout to avoid race with giveUp
+        if (fallbackChecks >= Math.floor(CFG.gridWaitMs / 500) - 1) {
+          clearInterval(checkInterval);
+        }
+      }, 500);
+      
       const giveUp = setTimeout(() => {
         warn('eBay grid wait timeout - checking for partial render...');
         finish(present());
@@ -914,10 +944,14 @@ function sleepPaced(ms, run) {
       // Human-like pacing BEFORE parsing — but only when the user can see the
       // tab. A backgrounded tab skips straight to parsing so a hidden scrape
       // finishes in ~1s instead of idling through the full delay chain.
+      // Reduced delays to leave more time for grid wait within the deadline.
       if (!document.hidden) {
         await humanPause(run, CFG.preParseMinMs, CFG.preParseMaxMs);
         if (!isCurrent(run)) return;
         await humanScroll(run);
+        if (!isCurrent(run)) return;
+        // Extra settle pause after scrolling to let lazy-loaded images/containers render
+        await humanPause(run, 200, 400);
         if (!isCurrent(run)) return;
       }
 
