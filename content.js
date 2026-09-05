@@ -394,42 +394,44 @@ function sleepPaced(ms, run) {
       }
     ];
 
-    let allNodes = [];
-    let matchedGroup = null;
+    // CRITICAL FIX: Collect ALL nodes from ALL selector groups, not just the first match.
+    // Use a Map keyed by ASIN to deduplicate while maximizing coverage.
+    const byAsin = new Map();
+    let totalFound = 0;
 
     for (const group of selectorGroups) {
       for (const selector of group.selectors) {
         try {
+          // querySelectorAll returns ALL matching elements, not just the first
           const nodes = Array.from(document.querySelectorAll(selector));
           if (nodes.length > 0) {
             log(`Selector group "${group.name}" matched ${nodes.length} nodes via: ${selector}`);
-            allNodes = nodes;
-            matchedGroup = group.name;
-            break;
+            totalFound += nodes.length;
+            
+            // Add each node to our collection, keyed by ASIN to avoid duplicates
+            for (const node of nodes) {
+              const asin = node.getAttribute('data-asin');
+              if (asin && asin.length === 10 && !byAsin.has(asin)) {
+                // Verify this container has a product link
+                if (node.querySelector('a[href*="/dp/"], a[href*="/gp/product/"], a[href*="/sspa/click/"]')) {
+                  byAsin.set(asin, node);
+                }
+              }
+            }
           }
         } catch (e) {
           warn(`Selector error in group "${group.name}": ${selector}`, e.message);
         }
       }
-      if (allNodes.length >= 2) break;
     }
 
-    // Filter to only containers that have valid ASINs and product links
-    const filtered = allNodes.filter((n) => {
-      const asin = n.getAttribute('data-asin');
-      if (!asin || asin.length !== 10) return false;
-      // Check for product link within container
-      const hasProductLink = n.querySelector('a[href*="/dp/"], a[href*="/gp/product/"], a[href*="/sspa/click/"]');
-      return !!hasProductLink;
-    });
+    const allNodes = Array.from(byAsin.values());
+    log(`Total unique ASIN containers found: ${allNodes.length} (from ${totalFound} raw matches)`);
 
-    log(`Filtered containers: ${filtered.length}/${allNodes.length} (matched group: ${matchedGroup})`);
-
-    if (filtered.length >= 2) return filtered;
+    if (allNodes.length >= 2) return allNodes;
 
     // Fallback: group every product anchor by its ASIN and use its wrapper.
     log('Attempting anchor-based fallback...');
-    const byAsin = new Map();
     const anchorSelectors = [
       'a[href*="/dp/"]',
       'a[href*="/gp/product/"]',
@@ -905,28 +907,95 @@ function sleepPaced(ms, run) {
   }
 
   function ebayContainers() {
-    // Strategy A: classic river layout.
-    let nodes = Array.from(document.querySelectorAll('li.s-item'))
-      .filter((n) => n.querySelector('a[href*="/itm/"]'));
-    if (nodes.length >= 3) return nodes;
-
-    // Strategy B: newer card grid layout.
-    nodes = Array.from(document.querySelectorAll('div.s-card, div[class*="s-card"], ul.srp-results li, li.s-item, div.srp-results li'))
-      .filter((n) => n.querySelector('a[href*="/itm/"]'));
-    if (nodes.length >= 3) return nodes;
-
-    // Strategy C: data-testid based containers (modern eBay).
-    nodes = Array.from(document.querySelectorAll('div[data-testid="search-result"], article.s-item'))
-      .filter((n) => n.querySelector('a[href*="/itm/"]'));
-    if (nodes.length >= 3) return nodes;
-
-    // Strategy D: wrapper-based selection.
-    nodes = Array.from(document.querySelectorAll('.s-item__wrapper, div.s-item'))
-      .filter((n) => n.querySelector('a[href*="/itm/"]'));
-    if (nodes.length >= 2) return nodes;
-
-    // Strategy E: generic anchor-based fallback (layout fully changed).
+    // CRITICAL FIX: Collect ALL nodes from ALL selector strategies, not just the first match.
+    // Use a Map keyed by item ID to deduplicate while maximizing coverage.
     const byId = new Map();
+    let totalFound = 0;
+
+    // Strategy A: classic river layout (li.s-item)
+    try {
+      const nodes = Array.from(document.querySelectorAll('li.s-item'));
+      if (nodes.length > 0) {
+        log(`eBay strategy "classic-river" matched ${nodes.length} nodes`);
+        totalFound += nodes.length;
+        for (const n of nodes) {
+          const anchor = n.querySelector('a[href*="/itm/"]');
+          if (!anchor) continue;
+          const m = anchor.href.match(/\/itm\/(\d{9,})/);
+          if (m && !byId.has(m[1])) {
+            byId.set(m[1], n);
+          }
+        }
+      }
+    } catch (e) {
+      warn('Selector error in strategy "classic-river":', e.message);
+    }
+
+    // Strategy B: newer card grid layout
+    try {
+      const nodes = Array.from(document.querySelectorAll('div.s-card, div[class*="s-card"], ul.srp-results li, li.s-item, div.srp-results li'));
+      if (nodes.length > 0) {
+        log(`eBay strategy "card-grid" matched ${nodes.length} nodes`);
+        totalFound += nodes.length;
+        for (const n of nodes) {
+          const anchor = n.querySelector('a[href*="/itm/"]');
+          if (!anchor) continue;
+          const m = anchor.href.match(/\/itm\/(\d{9,})/);
+          if (m && !byId.has(m[1])) {
+            byId.set(m[1], n);
+          }
+        }
+      }
+    } catch (e) {
+      warn('Selector error in strategy "card-grid":', e.message);
+    }
+
+    // Strategy C: data-testid based containers (modern eBay)
+    try {
+      const nodes = Array.from(document.querySelectorAll('div[data-testid="search-result"], article.s-item'));
+      if (nodes.length > 0) {
+        log(`eBay strategy "data-testid" matched ${nodes.length} nodes`);
+        totalFound += nodes.length;
+        for (const n of nodes) {
+          const anchor = n.querySelector('a[href*="/itm/"]');
+          if (!anchor) continue;
+          const m = anchor.href.match(/\/itm\/(\d{9,})/);
+          if (m && !byId.has(m[1])) {
+            byId.set(m[1], n);
+          }
+        }
+      }
+    } catch (e) {
+      warn('Selector error in strategy "data-testid":', e.message);
+    }
+
+    // Strategy D: wrapper-based selection
+    try {
+      const nodes = Array.from(document.querySelectorAll('.s-item__wrapper, div.s-item'));
+      if (nodes.length > 0) {
+        log(`eBay strategy "wrapper" matched ${nodes.length} nodes`);
+        totalFound += nodes.length;
+        for (const n of nodes) {
+          const anchor = n.querySelector('a[href*="/itm/"]');
+          if (!anchor) continue;
+          const m = anchor.href.match(/\/itm\/(\d{9,})/);
+          if (m && !byId.has(m[1])) {
+            byId.set(m[1], n);
+          }
+        }
+      }
+    } catch (e) {
+      warn('Selector error in strategy "wrapper":', e.message);
+    }
+
+    // Return collected items if we found a reasonable amount
+    if (byId.size >= 2) {
+      log(`Total unique eBay items found: ${byId.size} (from ${totalFound} raw matches)`);
+      return Array.from(byId.values());
+    }
+
+    // Strategy E: generic anchor-based fallback (layout fully changed)
+    log('Attempting anchor-based fallback...');
     document.querySelectorAll('a[href*="/itm/"]').forEach((a) => {
       const m = a.href.match(/\/itm\/(\d{9,})/);
       if (!m || byId.has(m[1])) return;
@@ -936,7 +1005,6 @@ function sleepPaced(ms, run) {
     });
     log(`eBay anchor fallback found ${byId.size} unique item IDs`);
     
-    // If we found anchors but wrappers are too generic, try to expand the container
     if (byId.size > 0) {
       return Array.from(byId.values());
     }
