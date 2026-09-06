@@ -51,7 +51,7 @@ let sort = { key: 'profit', dir: 'desc' };
 
 const ERROR_LABELS = {
   blocked: 'blocked (bot check / CAPTCHA)',
-  timeout: 'timed out (30s ceiling)',
+  timeout: 'timed out (45s ceiling)',
   'no-results': 'no results found',
   'no-results-page': 'redirected to a non-search page',
   closed: 'tab was closed',
@@ -65,7 +65,7 @@ function chipText(siteName, st) {
   const count = st.items ? st.items.length : 0;
   switch (st.status) {
     case 'idle': return `${siteName}: queued`;
-    case 'loading': return `${siteName}: loading…`;
+    case 'loading': return st.page ? `${siteName}: page ${st.page} loading…` : `${siteName}: loading…`;
     case 'done': return `${siteName}: ${count} item${count === 1 ? '' : 's'}`;
     case 'error': return `${siteName}: ${ERROR_LABELS[st.error] || st.error}`;
     default: return `${siteName}: —`;
@@ -104,14 +104,16 @@ function render() {
     const ebay = state.sites.ebay;
     const elapsed = Math.min(99, Math.floor((Date.now() - (state.startedAt || Date.now())) / 1000));
     let step;
-    if (amz.status === 'loading') {
-      step = 'Step 1 of 2 — searching Amazon…';
-    } else if (amz.status === 'done' && ebay.status === 'loading') {
-      step = 'Step 2 of 2 — searching eBay & comparing…';
+    if (ebay.status === 'loading') {
+      const page = ebay.page || 1;
+      step = `Step 1 of 2 — searching eBay page ${page} of 3…`;
+    } else if ((ebay.status === 'done' || ebay.status === 'error') && amz.status === 'loading') {
+      const page = amz.page || 1;
+      step = `Step 2 of 2 — searching Amazon page ${page} of 3 & comparing…`;
     } else {
       step = 'Comparing results…';
     }
-    // The run is hard-bounded in the background (30s per stage), so a spinner
+    // The run is hard-bounded in the background (45s per stage), so a spinner
     // older than that is a stale optimistic state from before the worker
     // replied — tell the user instead of spinning silently.
     els.progressText.textContent = elapsed >= 60
@@ -121,11 +123,11 @@ function render() {
     els.progressText.textContent = 'Done.';
   }
 
-  renderChip(els.chipAmazon, els.chipAmazon.querySelector('.lbl'), 'Amazon', state.sites.amazon);
   renderChip(els.chipEbay, els.chipEbay.querySelector('.lbl'), 'eBay', state.sites.ebay);
+  renderChip(els.chipAmazon, els.chipAmazon.querySelector('.lbl'), 'Amazon', state.sites.amazon);
 
   // "Parse again" appears whenever some site is in an error state.
-  const anyError = ['amazon', 'ebay'].some((s) => state.sites[s].status === 'error');
+  const anyError = ['ebay', 'amazon'].some((s) => state.sites[s].status === 'error');
   els.retry.classList.toggle('hidden', !anyError);
 
   renderBanner();
@@ -134,15 +136,16 @@ function render() {
 
 function renderBanner() {
   const lines = [];
-  for (const s of ['amazon', 'ebay']) {
+  for (const s of ['ebay', 'amazon']) {
     const st = state.sites[s];
     if (st.status === 'error') {
+      const name = s === 'amazon' ? 'Amazon' : 'eBay';
       const label = ERROR_LABELS[st.error] || st.error;
       if (st.error === 'blocked') {
         lines.push(`<b>${name}</b> served a bot check (${label}). ` +
           `The results tab is open in the background — solve the check there, then click <b>Parse again</b>.`);
       } else if (st.error === 'timeout') {
-        lines.push(`<b>${name}</b> hit the 30s load ceiling (${label}). The page may be slow, or Amazon served a layout/bot check the parser did not recognize. Check the tab, then click <b>Parse again</b>.`);
+        lines.push(`<b>${name}</b> hit the 45s load ceiling (${label}). The page may be slow, or the marketplace served a layout/bot check the parser did not recognize. Check the tab, then click <b>Parse again</b>.`);
       } else if (st.error === 'no-results') {
         lines.push(`<b>${name}</b> loaded but no parsable results were found (${label}). If the page shows results, the layout may have changed — click <b>Parse again</b> after checking the tab.`);
       } else if (st.error === 'closed') {
@@ -170,7 +173,7 @@ function ping() {
 /**
  * Popup-side watchdog, active ONLY while a run is in its searching phase:
  * re-renders the elapsed timer each second and probes the background if it
- * has been silent for 40s (its own per-stage watchdog is 30s, so silence
+ * has been silent for 50s (its own per-stage watchdog is 45s, so silence
  * past that means the worker was killed or the channel is broken — say so
  * instead of spinning forever). The interval self-cancels the moment the
  * run leaves the searching phase; nothing times out here permanently.
@@ -192,7 +195,7 @@ function startTicker() {
       return;
     }
     render(); // updates the elapsed-seconds readout
-    if (Date.now() - lastStateAt > 40000) {
+    if (Date.now() - lastStateAt > 50000) {
       lastStateAt = Date.now();
       ping().then((res) => {
         if (res && res.ok && res.state) {
@@ -264,57 +267,51 @@ function cell(value, cls) {
   return td;
 }
 
-function buildRow(p) {
-  const v = rowValues(p);
-  const tr = document.createElement('tr');
-
-  // --- Product column (Amazon title, image, link) ---
-  const tdProd = document.createElement('td');
-  const prod = makeEl('div', 'prod');
-  const img = p.amazon.image;
+function productCell(item, host, extra) {
+  const td = document.createElement('td');
+  const wrap = makeEl('div', extra || 'prod');
+  const img = item.image;
   if (img) {
     const im = document.createElement('img');
     im.src = img;
     im.alt = '';
     im.loading = 'lazy';
     im.addEventListener('error', () => im.remove());
-    prod.appendChild(im);
+    wrap.appendChild(im);
   } else {
-    prod.appendChild(makeEl('span', 'ph', (p.amazon.title[0] || '?').toUpperCase()));
+    wrap.appendChild(makeEl('span', 'ph', (item.title[0] || '?').toUpperCase()));
   }
-  const aTitle = makeEl('a', 't', p.amazon.title);
-  aTitle.href = safeUrl(p.amazon.url, 'amazon') || '#';
-  aTitle.target = '_blank';
-  aTitle.rel = 'noopener';
-  aTitle.title = p.amazon.title;
-  prod.appendChild(aTitle);
-  tdProd.appendChild(prod);
-  tr.appendChild(tdProd);
+  const title = makeEl('a', 't ellipsis', item.title);
+  title.href = safeUrl(item.url, host) || '#';
+  title.target = '_blank';
+  title.rel = 'noopener';
+  title.title = item.title;
+  wrap.appendChild(title);
+  td.appendChild(wrap);
+  return td;
+}
 
-  // --- Buy (Amazon price) ---
-  const tdBuy = makeEl('td', 'money');
-  tdBuy.textContent = p.amazon.price != null ? fmtUSD.format(v.buy) : '—';
-  tr.appendChild(tdBuy);
+function buildRow(p) {
+  const v = rowValues(p);
+  const tr = document.createElement('tr');
 
-  // --- eBay listing column ---
-  const tdEbay = document.createElement('td');
-  const ebayCell = makeEl('div', 'ebay-cell');
-  const eTitle = makeEl('a', 't ellipsis', p.ebay.title);
-  eTitle.href = safeUrl(p.ebay.url, 'ebay') || '#';
-  eTitle.target = '_blank';
-  eTitle.rel = 'noopener';
-  eTitle.title = p.ebay.title;
-  const matchLbl = makeEl('span', 'match', `title match ${p.sim}%`);
-  ebayCell.appendChild(eTitle);
-  ebayCell.appendChild(matchLbl);
-  tdEbay.appendChild(ebayCell);
+  // --- eBay listing column first (source listing for dropshipping review) ---
+  const tdEbay = productCell(p.ebay, 'ebay', 'prod ebay-cell');
+  tdEbay.querySelector('.prod').appendChild(makeEl('span', 'match', `title match ${p.sim}%`));
   tr.appendChild(tdEbay);
 
-  // --- Sell, Fees, Profit, Margin ---
   const tdSell = makeEl('td', 'money');
   tdSell.textContent = fmtUSD.format(v.sell);
   tr.appendChild(tdSell);
 
+  // --- Amazon product column second (cross-reference/buy side) ---
+  tr.appendChild(productCell(p.amazon, 'amazon', 'prod'));
+
+  const tdBuy = makeEl('td', 'money');
+  tdBuy.textContent = p.amazon.price != null ? fmtUSD.format(v.buy) : '—';
+  tr.appendChild(tdBuy);
+
+  // --- Fees, Profit, Margin ---
   const tdFees = makeEl('td', 'money');
   tdFees.textContent = `−${fmtUSD.format(v.fees)}`;
   tr.appendChild(tdFees);
@@ -338,8 +335,8 @@ function renderResults() {
   const sum = state.summary || {};
   const base = `Matched <b>${sum.pairs}</b> pair${sum.pairs === 1 ? '' : 's'}`;
   const detail = [];
-  if (sum.amzTotal) detail.push(`${sum.amzTotal} Amazon`);
   if (sum.ebayTotal) detail.push(`${sum.ebayTotal} eBay`);
+  if (sum.amzTotal) detail.push(`${sum.amzTotal} Amazon`);
   const unmatched = (sum.ebayTotal || 0) - (sum.ebayUsed || 0);
   const unmatchedTxt = unmatched > 0 ? ` (${unmatched} eBay listings unpaired)` : '';
   els.summary.innerHTML = `${base} · ${detail.join(' / ')}${unmatchedTxt}`;
@@ -372,7 +369,7 @@ function renderResults() {
     } else if (sum.pairs === 0 && amzErr) {
       text = 'Amazon could not be parsed, so no comparisons were made. eBay still found items — try "Parse again" after fixing Amazon.';
     } else if (sum.pairs === 0 && ebayErr) {
-      text = 'eBay could not be parsed, so no comparisons were made. Amazon was searched successfully — try "Parse again" after fixing eBay.';
+      text = 'eBay could not be parsed, so the Amazon cross-reference was not completed. Try "Parse again" after fixing eBay.';
     } else if (sum.pairs === 0) {
       text = 'No matching product pairs were found across the two marketplaces. Try a more specific or brand-inclusive query (e.g. "Stanley 40 oz Quencher"), or lower your fee assumption.';
     } else {
@@ -427,8 +424,8 @@ async function startCompare() {
     phase: 'searching',
     startedAt: Date.now(),
     sites: {
-      amazon: { status: 'loading', items: [], error: null, tabId: null, url: null },
-      ebay: { status: 'idle', items: [], error: null, tabId: null, url: null }
+      amazon: { status: 'idle', items: [], error: null, tabId: null, url: null, page: 1, pagesDone: 0 },
+      ebay: { status: 'loading', items: [], error: null, tabId: null, url: null, page: 1, pagesDone: 0 }
     },
     pairs: [],
     summary: {}
@@ -487,10 +484,10 @@ async function resetData() {
   els.feeRate.value = '13'; // default fee rate
 
   // Reset chips to idle state
-  els.chipAmazon.classList.remove('busy', 'done', 'err');
   els.chipEbay.classList.remove('busy', 'done', 'err');
-  els.chipAmazon.querySelector('.lbl').textContent = 'Amazon: waiting';
+  els.chipAmazon.classList.remove('busy', 'done', 'err');
   els.chipEbay.querySelector('.lbl').textContent = 'eBay: waiting';
+  els.chipAmazon.querySelector('.lbl').textContent = 'Amazon: waiting';
 
   // Clear table rows and summary
   els.rows.innerHTML = '';
@@ -544,8 +541,8 @@ function init() {
   els.q.addEventListener('keydown', (e) => { if (e.key === 'Enter') startCompare(); });
 
   els.retry.addEventListener('click', forceParse);
-  els.openAmazon.addEventListener('click', () => openResults('amazon'));
   els.openEbay.addEventListener('click', () => openResults('ebay'));
+  els.openAmazon.addEventListener('click', () => openResults('amazon'));
   els.reset.addEventListener('click', resetData);
 
   els.feeRate.addEventListener('change', () => {

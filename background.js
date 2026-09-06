@@ -38,21 +38,38 @@
  * Constants / config
  * ------------------------------------------------------------------ */
 const SEARCH_URLS = {
-  amazon: (q) => `https://www.amazon.com/s?k=${encodeURIComponent(q)}&ref=nb_sb_noss`,
-  ebay: (q) => `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(q)}&_sacat=0`
+  amazon: (q, page) => {
+    const p = Math.max(1, Number(page) || 1);
+    return `https://www.amazon.com/s?k=${encodeURIComponent(q)}&page=${p}&ref=sr_pg_${p}`;
+  },
+  ebay: (q, page) => {
+    const p = Math.max(1, Number(page) || 1);
+    return `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(q)}&_sacat=0&_pgn=${p}`;
+  }
 };
 
 // eBay final-value fee is ~13.25% for most categories (2025); the popup lets
 // the user override this per run. We only store raw prices here.
 const MATCH_THRESHOLD = 0.34; // min title-similarity for a pair (0..1)
 const MAX_PAIRS = 80;
+// eBay page count is now DETECTED dynamically from the search page (content.js
+// reports `maxPage`). This constant is only a safe fallback when the pagination
+// element can't be found or is malformed — NOT a hard cap anymore.
+const EBAY_FALLBACK_MAX_PAGES = 3;
+// Hard safety ceiling so a malformed pagination element can't cause an
+// unbounded loop. eBay typically caps search pagination at 100 pages.
+const EBAY_ABSOLUTE_MAX_PAGES = 100;
+const AMAZON_MAX_PAGES = 5;
+// Rate-limit / anti-blocking delays between Amazon page navigations (ms).
+const AMAZON_PAGE_DELAY_MIN_MS = 800;
+const AMAZON_PAGE_DELAY_MAX_MS = 3000;
 
-// Per-stage hard timeout. The content script itself is bounded to 10s; this
+// Per-stage hard timeout. The content script itself is bounded; this
 // covers everything around it (navigation, first paint, message latency).
 // It is implemented as a plain setTimeout — timers are cheap and reliable
 // while the service worker is alive — plus a chrome.alarms failsafe for the
 // case where Chrome kills the worker and never resumes it.
-const STAGE_TIMEOUT_MS = 30000;
+const STAGE_TIMEOUT_MS = 45000;
 const ALARM_WATCHDOG_MIN = 2; // failsafe alarm, in minutes
 
 /* ------------------------------------------------------------------ *
@@ -70,7 +87,7 @@ let cache = null; // in-memory mirror; survives only while the SW is alive
 const stageTimers = {};
 
 function emptySiteState() {
-  return { status: 'idle', items: [], error: null, tabId: null, url: null };
+  return { status: 'idle', items: [], error: null, tabId: null, url: null, page: 1, pagesDone: 0, maxPage: null };
 }
 
 function newRunState(query, runId) {
@@ -116,9 +133,9 @@ function broadcast() {
 const alarmName = (runId, site) => `arb.${runId}.${site}`;
 
 /**
- * Arm the watchdog for a stage: a one-shot 30s setTimeout PLUS a 2-minute
+ * Arm the watchdog for a stage: a one-shot setTimeout PLUS a 2-minute
  * alarm failsafe. Why both?
- *   - The setTimeout is the real deadline users feel (30s, not 1–2 min).
+ *   - The setTimeout is the real deadline users feel (45s, not 1–2 min).
  *   - The alarm exists only because Chrome may kill an idle MV3 service
  *     worker, which silently destroys its setTimeout timers. The alarm re-arms
  *     the worker and lets it mark the run failed instead of leaving the popup
@@ -159,7 +176,7 @@ async function clearAlarmsForRun(runId) {
   } catch (_) { /* noop */ }
 }
 
-/** A stage blew its 30s deadline -> record the reason and move the run on. */
+/** A stage blew its deadline -> record the reason and move the run on. */
 async function handleStageTimeout(runId, site) {
   await ensureState();
   if (!cache || cache.runId !== runId) return; // a newer run owns this slot
@@ -194,7 +211,7 @@ async function startRun(query) {
     if (old.sites.amazon.status === 'loading') clearWatch('amazon');
     if (old.sites.ebay.status === 'loading') clearWatch('ebay');
   }
-  await commit(); // show "Amazon loading" immediately in the popup
+  await commit(); // show "eBay loading" immediately in the popup
 
   // Housekeeping for the previous run (best-effort): drop its stale alarms
   // and close its result tabs so they can't deliver late ARB_RESULTS messages.
@@ -208,34 +225,125 @@ async function startRun(query) {
   // leaving a 'searching' run with no active stage — that ghost state is
   // exactly what used to spin the popup forever.
   try {
-    await openSearchTab('amazon');
+    await openSearchTab('ebay', { page: 1, resetItems: true });
   } catch (e) {
-    console.warn('[arb] could not open Amazon tab:', e);
-    cache.sites.amazon.status = 'error';
-    cache.sites.amazon.error = 'open-failed';
+    console.warn('[arb] could not open eBay tab:', e);
+    cache.sites.ebay.status = 'error';
+    cache.sites.ebay.error = 'open-failed';
     cache.phase = 'idle';
   }
   await commit();
 }
 
 /** Open (or refocus) the results tab for a marketplace and arm the watchdog. */
-async function openSearchTab(site) {
+async function openSearchTab(site, opts) {
+  opts = opts || {};
   const ss = cache.sites[site];
+  const page = site === 'ebay' || site === 'amazon'
+    ? Math.max(1, Number(opts.page || ss.page || 1))
+    : 1;
+  const query = site === 'amazon'
+    ? amazonCrossReferenceQuery(cache.query, cache.sites.ebay.items || [])
+    : cache.query;
+  const url = site === 'ebay' ? SEARCH_URLS.ebay(query, page) : SEARCH_URLS.amazon(query, page);
   let tab;
   try { tab = await chrome.tabs.get(ss.tabId); } catch (_) { tab = null; }
 
   if (!tab) {
-    tab = await chrome.tabs.create({ url: SEARCH_URLS[site](cache.query), active: false });
+    tab = await chrome.tabs.create({ url, active: false });
     ss.tabId = tab.id;
   } else {
-    await chrome.tabs.update(tab.id, { active: true });
+    tab = await chrome.tabs.update(tab.id, { url, active: false });
   }
-  ss.url = tab.url || SEARCH_URLS[site](cache.query);
+  ss.url = tab.url || url;
+  ss.page = page;
   ss.status = 'loading';
   ss.error = null;
-  ss.items = [];
+  if (opts.resetItems) {
+    ss.items = [];
+    ss.pagesDone = 0;
+  }
   setWatch(site);
   await commit();
+}
+
+function amazonCrossReferenceQuery(fallbackQuery, ebayItems) {
+  // Tuning placeholder: this is where Amazon lookup strategy belongs.
+  // Current behavior keeps one broad Amazon search using the original query,
+  // then computePairs() cross-references those Amazon results against every
+  // eBay item captured across all dynamically-detected eBay pages.
+  //
+  // For narrower dropshipping research, replace this with a normalized title
+  // from ebayItems[0], a shared keyword extraction pass, or a per-item lookup
+  // flow that opens/searches Amazon once per selected eBay listing.
+  return fallbackQuery;
+}
+
+function searchUrlForSite(site) {
+  if (site === 'ebay') {
+    const page = (cache.sites.ebay && cache.sites.ebay.page) || 1;
+    return SEARCH_URLS.ebay(cache.query, page);
+  }
+  const page = (cache.sites.amazon && cache.sites.amazon.page) || 1;
+  return SEARCH_URLS.amazon(amazonCrossReferenceQuery(cache.query, cache.sites.ebay.items || []), page);
+}
+
+function dedupeItems(items) {
+  const byId = new Map();
+  for (const item of Array.isArray(items) ? items : []) {
+    if (!item) continue;
+    const key = item.id || item.url || `${item.site}:${item.title}:${item.price}`;
+    if (key && !byId.has(key)) byId.set(key, item);
+  }
+  return Array.from(byId.values());
+}
+
+async function continueEbayPagination() {
+  const ss = cache.sites.ebay;
+
+  // Dynamic page limit: use the max page reported by content.js from eBay's
+  // own pagination controls. Falls back to EBAY_FALLBACK_MAX_PAGES (3) when
+  // the pagination element was missing/malformed, and is hard-capped by
+  // EBAY_ABSOLUTE_MAX_PAGES so a corrupted page number can't cause an
+  // unbounded scrape.
+  const detectedMax = Number.isInteger(ss.maxPage) && ss.maxPage > 0
+    ? ss.maxPage
+    : EBAY_FALLBACK_MAX_PAGES;
+  const ebayMaxPages = Math.min(detectedMax, EBAY_ABSOLUTE_MAX_PAGES);
+  console.log(`[arb] eBay pagination: current=${ss.page}, maxPages=${ebayMaxPages}${Number.isInteger(ss.maxPage) ? ` (detected=${ss.maxPage})` : ' (fallback)'}`);
+
+  const nextPage = (ss.page || 1) + 1;
+  if (nextPage <= ebayMaxPages) {
+    // Add a small human-like delay between eBay page navigations too, to keep
+    // request volume low and avoid tripping bot detection.
+    const delayMs = AMAZON_PAGE_DELAY_MIN_MS +
+      Math.floor(Math.random() * (AMAZON_PAGE_DELAY_MAX_MS - AMAZON_PAGE_DELAY_MIN_MS + 1));
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    await openSearchTab('ebay', { page: nextPage, resetItems: false });
+    return;
+  }
+
+  ss.status = 'done';
+  await commit();
+  await openSearchTab('amazon', { page: 1, resetItems: true });
+}
+
+async function continueAmazonPagination() {
+  const ss = cache.sites.amazon;
+  const nextPage = (ss.page || 1) + 1;
+  if (nextPage <= AMAZON_MAX_PAGES) {
+    // Rate-limit handling: add a random human-like delay between Amazon page
+    // navigations to avoid triggering bot detection.
+    const delayMs = AMAZON_PAGE_DELAY_MIN_MS +
+      Math.floor(Math.random() * (AMAZON_PAGE_DELAY_MAX_MS - AMAZON_PAGE_DELAY_MIN_MS + 1));
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    await openSearchTab('amazon', { page: nextPage, resetItems: false });
+    return;
+  }
+
+  ss.status = 'done';
+  await commit();
+  await finalizeRun();
 }
 
 /** React to a failed stage: record the reason and keep the run moving. */
@@ -250,7 +358,7 @@ async function failStage(site, reason) {
   clearWatch(site);
   await commit();
 
-  if (site === 'amazon') await openSearchTab('ebay');
+  if (site === 'ebay') await openSearchTab('amazon', { page: 1, resetItems: true });
   else await finalizeRun();
 }
 
@@ -282,12 +390,20 @@ async function handleResults(msg, sender) {
     return;
   }
 
-  ss.status = 'done';
-  ss.items = Array.isArray(msg.items) ? msg.items : [];
-  await commit();
+  if (site === 'ebay') {
+    ss.items = dedupeItems([...(ss.items || []), ...(Array.isArray(msg.items) ? msg.items : [])]);
+    ss.pagesDone = Math.max(ss.pagesDone || 0, ss.page || 1);
+    // Capture the dynamically-detected page count (or null if unavailable).
+    if (Number.isInteger(msg.maxPage)) ss.maxPage = msg.maxPage;
+    await commit();
+    await continueEbayPagination();
+    return;
+  }
 
-  if (site === 'amazon') await openSearchTab('ebay');
-  else await finalizeRun();
+  ss.items = dedupeItems([...(ss.items || []), ...(Array.isArray(msg.items) ? msg.items : [])]);
+  ss.pagesDone = Math.max(ss.pagesDone || 0, ss.page || 1);
+  await commit();
+  await continueAmazonPagination();
 }
 
 const normalize = (s) => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
@@ -395,7 +511,7 @@ function computePairs(amazonItems, ebayItems) {
  * and if the retry's page had navigated away, nothing ever reported back and
  * the newly-armed alarm watchdog wrote an error into a phase the popup no
  * longer rendered. The fix: put the run back into a real 'searching' phase
- * (loading only the sites being retried), arm the 30s watchdog, and ALWAYS
+ * (loading only the sites being retried), arm the stage watchdog, and ALWAYS
  * finalize (or continue to the next site) once the retried stages settle.
  */
 async function forceParse(sites) {
@@ -404,6 +520,29 @@ async function forceParse(sites) {
 
   const wanted = sites.filter((s) => s === 'amazon' || s === 'ebay');
   if (!wanted.length) return;
+
+  // eBay owns the first stage now. Retrying eBay restarts the full paginated
+  // capture and then hands off to Amazon once all dynamically-detected pages
+  // finish (maxPage is re-detected on the first page parse).
+  if (wanted.includes('ebay')) {
+    cache.phase = 'searching';
+    cache.doneAt = null;
+    cache.startedAt = Date.now();
+    cache.pairs = [];
+    cache.sites.amazon.status = 'idle';
+    cache.sites.amazon.error = null;
+    cache.sites.amazon.items = [];
+    cache.sites.amazon.page = 1;
+    cache.sites.amazon.pagesDone = 0;
+    cache.sites.ebay.status = 'loading';
+    cache.sites.ebay.error = null;
+    cache.sites.ebay.items = [];
+    cache.sites.ebay.page = 1;
+    cache.sites.ebay.pagesDone = 0;
+    await commit();
+    await openSearchTab('ebay', { page: 1, resetItems: true });
+    return;
+  }
 
   // Verify the tabs actually exist before touching state; a dead tabId is the
   // classic reason a retry never answered and the UI spun forever.
@@ -414,9 +553,10 @@ async function forceParse(sites) {
     try { tab = await chrome.tabs.get(ss.tabId); } catch (_) { tab = null; }
     if (!tab) {
       try {
-        tab = await chrome.tabs.create({ url: SEARCH_URLS[site](cache.query), active: false });
+        const url = searchUrlForSite(site);
+        tab = await chrome.tabs.create({ url, active: false });
         ss.tabId = tab.id;
-        ss.url = tab.url || SEARCH_URLS[site](cache.query);
+        ss.url = tab.url || url;
       } catch (_) { /* fall through; injection will report the failure */ }
     }
     reopened[site] = !!tab;
@@ -433,6 +573,13 @@ async function forceParse(sites) {
     ss.status = 'loading';
     ss.error = null;
     ss.items = [];
+    if (site === 'ebay') {
+      ss.page = 1;
+      ss.pagesDone = 0;
+    } else if (site === 'amazon') {
+      ss.page = 1;
+      ss.pagesDone = 0;
+    }
   }
   await commit();
 
@@ -444,7 +591,7 @@ async function forceParse(sites) {
       continue;
     }
 
-    setWatch(site); // 30s active watchdog for this retry
+    setWatch(site); // active watchdog for this retry
 
     // 1) Ask the already-injected content script to re-run (it validates the
     //    run token, so only the current script instance answers).
@@ -480,9 +627,10 @@ async function openResultsTab(site) {
   }
   // Reopen — but only re-arm a pending stage if we are still waiting on it.
   const stillWaiting = cache.phase === 'searching' && ss.status === 'loading';
-  const created = await chrome.tabs.create({ url: SEARCH_URLS[site](cache.query), active: true });
+  const url = searchUrlForSite(site);
+  const created = await chrome.tabs.create({ url, active: true });
   ss.tabId = created.id;
-  ss.url = created.url || SEARCH_URLS[site](cache.query);
+  ss.url = created.url || url;
   if (stillWaiting) setWatch(site);
   await commit();
 }
@@ -534,7 +682,7 @@ async function handleMessage(msg, sender) {
 
 /**
  * Failsafe: re-arm the worker after Chrome killed it while a stage was in
- * flight. The 30s setTimeout watchdog dies with the worker; this alarm (set
+ * flight. The setTimeout watchdog dies with the worker; this alarm (set
  * at the same time) gives us one last chance to mark the stage 'timeout'
  * instead of leaving the popup spinner up forever.
  */

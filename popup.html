@@ -221,8 +221,8 @@
     <div class="progress-info">
       <div id="progressText">Starting…</div>
       <div class="chips">
-        <span class="chip" id="chipAmazon"><span class="dot"></span><span class="lbl">Amazon: waiting</span></span>
         <span class="chip" id="chipEbay"><span class="dot"></span><span class="lbl">eBay: waiting</span></span>
+        <span class="chip" id="chipAmazon"><span class="dot"></span><span class="lbl">Amazon: waiting</span></span>
       </div>
     </div>
     <button id="btnRetry" class="ghost hidden">Parse again</button>
@@ -243,10 +243,10 @@
       <table id="table">
         <thead>
           <tr>
-            <th data-key="product">Product (Amazon)</th>
-            <th data-key="buy" class="num">Buy</th>
             <th data-key="ebay">eBay listing</th>
             <th data-key="sell" class="num">Sell</th>
+            <th data-key="product">Amazon product</th>
+            <th data-key="buy" class="num">Buy</th>
             <th data-key="fees" class="num">Fees ≈</th>
             <th data-key="profit" class="num">Est. profit</th>
             <th data-key="margin" class="num">Margin</th>
@@ -259,8 +259,8 @@
   </section>
 
   <footer class="foot">
-    <button id="btnOpenAmazon" class="link" type="button">Open Amazon results</button>
     <button id="btnOpenEbay" class="link" type="button">Open eBay results</button>
+    <button id="btnOpenAmazon" class="link" type="button">Open Amazon results</button>
     <span>· Estimates only — excludes shipping, returns, taxes &amp; ad costs.</span>
     <button id="btnReset" class="link danger" type="button" title="Clear all stored comparison history and cached data">Reset Data</button>
   </footer>

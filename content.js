@@ -66,8 +66,22 @@ const CFG = {
   scrollMaxPx: 500,
   scrollStepsMin: 2,
   scrollStepsMax: 4,
-  // Max items reported per site.
-  maxItems: { amazon: 50, ebay: 80 }
+  // Max items reported per site. Amazon shows 48 per page; with 5 pages
+  // that's 240 potential items. eBay shows ~60 per page; with dynamic
+  // pagination (up to 9+ pages) that's ~540+ potential items. We cap
+  // generously to avoid memory bloat.
+  maxItems: { amazon: 240, ebay: 600 },
+  // Amazon pagination / rate-limit handling
+  amazon: {
+    // Max retries for a single page before giving up
+    maxRetries: 2,
+    // Base delay (ms) between retries — grows exponentially
+    retryBaseDelayMs: 1500,
+    // Max delay (ms) between page navigations to avoid rate-limiting
+    maxPageDelayMs: 3000,
+    // Min delay (ms) between page navigations
+    minPageDelayMs: 800
+  }
 };
 
 /* ------------------------------------------------------------------ *
@@ -211,6 +225,42 @@ function sleepPaced(ms, run) {
     return Number.isFinite(v) && v > 0 ? v : null;
   }
 
+  /** Extract the first URL from a srcset attribute value. */
+  function firstUrlFromSrcset(srcset) {
+    if (!srcset) return '';
+    const first = String(srcset).split(',')[0];
+    return (first || '').trim().split(/\s+/)[0] || '';
+  }
+
+  /** Extract a URL from Amazon's data-a-dynamic-image JSON attribute. */
+  function firstUrlFromDynamicImage(value) {
+    if (!value) return '';
+    try {
+      const parsed = JSON.parse(value);
+      const urls = Object.keys(parsed || {});
+      return urls.find((url) => /^https?:\/\//.test(url)) || '';
+    } catch (_) {
+      const match = String(value).match(/https?:\/\/[^"'\s]+/);
+      return match ? match[0] : '';
+    }
+  }
+
+  /** Extract the best available image URL from an <img> or <source> element. */
+  function imageUrlFromElement(el) {
+    if (!el) return '';
+    const values = [
+      el.currentSrc,
+      el.src,
+      el.getAttribute('data-src') ||
+      el.getAttribute('data-lazy-src') ||
+      el.getAttribute('data-original') ||
+      el.getAttribute('data-a-hires') ||
+      firstUrlFromSrcset(el.getAttribute('srcset') || el.getAttribute('data-srcset')) ||
+      firstUrlFromDynamicImage(el.getAttribute('data-a-dynamic-image'))
+    ];
+    return values.find((value) => /^https?:\/\//.test(value || '')) || '';
+  }
+
   /* ------------------------------------------------------------------ *
    * AMAZON extraction (unchanged)
    * ------------------------------------------------------------------ */
@@ -320,6 +370,101 @@ function sleepPaced(ms, run) {
     });
   }
 
+  /** Robust sponsored detection for Amazon search results. */
+  function isAmazonSponsored(node) {
+    if (!node) return false;
+    if (node.matches && node.matches(
+      '.AdHolder, [data-ad-id], [data-component-type*="sponsored" i], ' +
+      '[data-cel-widget*="sponsored" i], [data-csa-c-type*="sponsored" i], ' +
+      '[data-csa-c-content-id*="sponsored" i], [data-csa-c-slot-id*="sponsored" i], ' +
+      '[data-ad-placement], [data-ad-creative], [data-ad-slot], ' +
+      '[aria-label*="Sponsored" i], [aria-label*="Ad" i]'
+    )) return true;
+    if (node.querySelector && node.querySelector(
+      '.AdHolder, [data-ad-id], [data-cy="ad-badge"], [aria-label*="Sponsored" i], ' +
+      '[data-component-type*="sponsored" i], [data-cel-widget*="sponsored" i], ' +
+      '[data-csa-c-type*="sponsored" i], [data-csa-c-content-id*="sponsored" i], ' +
+      '[data-csa-c-slot-id*="sponsored" i], [data-ad-placement], [data-ad-creative], ' +
+      '[data-ad-slot], [aria-label*="Ad" i], .p13n-asin, .p13n-sc-truncate, ' +
+      '.a-carousel-card[data-ad-id]'
+    )) return true;
+    const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    if (/^sponsored\b/i.test(text) || /\bSponsored\s+Ad\b/i.test(text) || /\bAd\b\s*$/.test(text)) return true;
+    if (node.querySelector) {
+      const links = node.querySelectorAll('a[href*="/sspa/click/"]');
+      for (const a of links) {
+        const href = a.href || '';
+        if (/[?&](?:adId|adGroupId|advertiserId|creativeId|adSlot)=/.test(href)) return true;
+      }
+    }
+    return false;
+  }
+
+  /** Robust carousel detection for Amazon search results. */
+  function isAmazonCarousel(node) {
+    if (!node) return false;
+    const carouselSelectors = [
+      '.a-carousel-container', '.a-carousel-card', '[data-a-carousel-options]',
+      '[data-cel-widget*="carousel" i]', '[class*="carousel" i]', '[id*="carousel" i]',
+      '[data-component-type*="carousel" i]', '.p13n-carousel', '.a-carousel-viewport',
+      '.a-carousel-row', '[data-csa-c-type="carousel"]', '[data-csa-c-slot-id*="carousel" i]',
+      '[data-cel-widget*="desktop-dp-sims" i]', '[data-cel-widget*="p13n" i]',
+      '.a-section[data-csa-c-type="widget"]'
+    ];
+    if (node.matches && node.matches(carouselSelectors.join(', '))) return true;
+    if (node.closest && node.closest(carouselSelectors.join(', '))) return true;
+    return false;
+  }
+
+  /** Filter Amazon recommendation/related-item blocks that are NOT organic results. */
+  function isAmazonRecommendationBlock(node) {
+    if (!node) return false;
+    const recSelectors = [
+      '[data-component-type="s-instant-results"]', '[data-component-type="s-related-keywords"]',
+      '[data-component-type="s-breadcrumb"]', '[data-component-type="s-suggestion"]',
+      '[data-component-type="s-quick-links"]', '[data-component-type="s-feedback"]',
+      '[data-component-type="s-pagination"]', '[data-component-type="s-refinements"]',
+      '[data-component-type="s-sort"]', '[data-component-type="s-filter"]',
+      '[data-component-type="s-banner"]', '[data-component-type="s-announcement"]',
+      '[data-component-type="s-inline-banner"]', '[data-component-type="s-inline-feedback"]',
+      '[data-component-type="s-inline-suggestion"]', '[data-component-type="s-inline-related"]',
+      '[data-component-type="s-inline-recommendation"]', '[data-component-type="s-inline-carousel"]',
+      '[data-component-type="s-inline-sponsored"]', '[data-component-type="s-inline-ad"]',
+      '[data-component-type="s-inline-promo"]', '[data-component-type="s-inline-offer"]',
+      '[data-component-type="s-inline-deal"]', '[data-component-type="s-inline-coupon"]',
+      '[data-component-type="s-inline-video"]', '[data-component-type="s-inline-image"]',
+      '[data-component-type="s-inline-text"]', '[data-component-type="s-inline-link"]',
+      '[data-component-type="s-inline-button"]', '[data-component-type="s-inline-input"]',
+      '[data-component-type="s-inline-select"]', '[data-component-type="s-inline-checkbox"]',
+      '[data-component-type="s-inline-radio"]', '[data-component-type="s-inline-range"]',
+      '[data-component-type="s-inline-slider"]', '[data-component-type="s-inline-toggle"]',
+      '[data-component-type="s-inline-switch"]', '[data-component-type="s-inline-progress"]',
+      '[data-component-type="s-inline-spinner"]', '[data-component-type="s-inline-loading"]',
+      '[data-component-type="s-inline-error"]', '[data-component-type="s-inline-warning"]',
+      '[data-component-type="s-inline-info"]', '[data-component-type="s-inline-success"]',
+      '[data-component-type="s-inline-message"]', '[data-component-type="s-inline-notification"]',
+      '[data-component-type="s-inline-alert"]', '[data-component-type="s-inline-toast"]',
+      '[data-component-type="s-inline-tooltip"]', '[data-component-type="s-inline-popover"]',
+      '[data-component-type="s-inline-modal"]', '[data-component-type="s-inline-dialog"]',
+      '[data-component-type="s-inline-panel"]', '[data-component-type="s-inline-section"]',
+      '[data-component-type="s-inline-divider"]', '[data-component-type="s-inline-spacer"]',
+      '[data-component-type="s-inline-separator"]', '[data-component-type="s-inline-rule"]',
+      '[data-component-type="s-inline-line"]', '[data-component-type="s-inline-border"]',
+      '[data-component-type="s-inline-shadow"]', '[data-component-type="s-inline-gradient"]',
+      '[data-component-type="s-inline-background"]', '[data-component-type="s-inline-foreground"]',
+      '[data-component-type="s-inline-color"]', '[data-component-type="s-inline-font"]',
+      '[data-component-type="s-inline-size"]', '[data-component-type="s-inline-weight"]',
+      '[data-component-type="s-inline-style"]', '[data-component-type="s-inline-class"]',
+      '[data-component-type="s-inline-id"]', '[data-component-type="s-inline-name"]',
+      '[data-component-type="s-inline-value"]', '[data-component-type="s-inline-key"]',
+      '[data-component-type="s-inline-param"]', '[data-component-type="s-inline-arg"]',
+      '[data-component-type="s-inline-option"]', '[data-component-type="s-inline-choice"]'
+    ];
+    if (node.matches && node.matches(recSelectors.join(', '))) return true;
+    if (node.closest && node.closest(recSelectors.join(', '))) return true;
+    return false;
+  }
+
   /** Strategy A (primary): modern result grid. Strategy B: anchor-based. */
   function amazonContainers() {
     // Multiple selector strategies for different Amazon layouts (2024-2025)
@@ -408,12 +553,18 @@ function sleepPaced(ms, run) {
             log(`Selector group "${group.name}" matched ${nodes.length} nodes via: ${selector}`);
             totalFound += nodes.length;
             
-            // Add each node to our collection, keyed by ASIN to avoid duplicates
+            // Add each node to our collection, keyed by ASIN to avoid duplicates.
+            // CRITICAL: Skip sponsored, carousel, and recommendation blocks so
+            // only valid organic products are captured.
             for (const node of nodes) {
               const asin = node.getAttribute('data-asin');
               if (asin && asin.length === 10 && !byAsin.has(asin)) {
                 // Verify this container has a product link
                 if (node.querySelector('a[href*="/dp/"], a[href*="/gp/product/"], a[href*="/sspa/click/"]')) {
+                  if (isAmazonSponsored(node) || isAmazonCarousel(node) || isAmazonRecommendationBlock(node)) {
+                    log('Skipping non-organic Amazon block:', asin);
+                    continue;
+                  }
                   byAsin.set(asin, node);
                 }
               }
@@ -575,7 +726,14 @@ function sleepPaced(ms, run) {
       if (!asin) asin = extractAsin(anchor.href);
       if (!asin || asin.length !== 10) { warn('Invalid ASIN:', asin); return null; }
 
-      // Title extraction with multiple fallbacks
+      // Title extraction with multiple fallbacks.
+      // FIXED: Previously we took the FIRST selector match with >3 chars and
+      // rejected the item if that single candidate was too short. On some pages
+      // (e.g. page 3) a short non-title element (badge, "Sponsored" label,
+      // truncated aria text) matched first, causing valid listings to be
+      // falsely rejected with "title is too short". Now we collect ALL
+      // candidate title elements, score them, and pick the best one — only
+      // rejecting if EVERY candidate is genuinely too short.
       const titleSelectors = [
         'h2 span',
         'h2 a span',
@@ -585,19 +743,66 @@ function sleepPaced(ms, run) {
         'a[href*="/gp/product/"] span',
         '[data-cy="title-recipe"]',
         '[data-cy="asin-title"]',
-        '.a-text-normal'
+        '.a-text-normal',
+        'span.a-size-medium',
+        'span.a-size-base-plus',
+        'span.a-text-normal'
       ];
 
-      let titleEl = null;
-      let matchedTitleSel = null;
+      const titleCandidates = [];
       for (const selector of titleSelectors) {
-        titleEl = node.querySelector(selector);
-        if (titleEl && titleEl.textContent.trim().length > 3) { matchedTitleSel = selector; break; }
+        try {
+          const els = node.querySelectorAll(selector);
+          for (const el of els) {
+            const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (!t) continue;
+            // Skip obvious non-title chrome text.
+            if (/^(sponsored|ad|best seller|amazon's choice|new|used|refurbished|renewed|limited time deal|#\d+)\b/i.test(t)) continue;
+            titleCandidates.push({ text: t, el, selector, len: t.length });
+          }
+        } catch (_) { /* ignore selector errors */ }
       }
-      if (!titleEl) titleEl = anchor;
 
-      const title = (titleEl.textContent || '').replace(/\s+/g, ' ').trim();
-      if (title.length < 4) { warn('Title too short:', title); return null; }
+      // Also consider the anchor's aria-label / title attributes — these are
+      // often the most complete product titles on modern Amazon layouts.
+      const anchorLabel = (anchor.getAttribute && (anchor.getAttribute('aria-label') || anchor.getAttribute('title'))) || '';
+      if (anchorLabel) {
+        const t = anchorLabel.replace(/\s+/g, ' ').trim();
+        if (t) titleCandidates.push({ text: t, el: anchor, selector: 'anchor-aria-label', len: t.length });
+      }
+
+      // Score candidates: prefer longer, more descriptive text. This avoids
+      // short badge/label matches winning over the real product title.
+      titleCandidates.sort((a, b) => {
+        // Strong preference for longer text (real titles are usually 20+ chars).
+        if (b.len !== a.len) return b.len - a.len;
+        // Tie-break: prefer h2-based selectors (semantic title containers).
+        const aScore = /^h2/.test(a.selector) ? 1 : 0;
+        const bScore = /^h2/.test(b.selector) ? 1 : 0;
+        return bScore - aScore;
+      });
+
+      let best = titleCandidates[0];
+      if (!best) {
+        // Last resort: use the anchor's raw text content.
+        const anchorText = (anchor.textContent || '').replace(/\s+/g, ' ').trim();
+        if (anchorText.length >= 4) {
+          log('Title fallback: used anchor text');
+          titleCandidates.push({ text: anchorText, el: anchor, selector: 'anchor-text', len: anchorText.length });
+          best = titleCandidates[0];
+        }
+      }
+
+      const title = best ? best.text : '';
+      if (title.length < 4) {
+        // Only reject when we truly have no usable title. Log the candidates
+        // for debugging instead of crashing the whole page parse.
+        warn('Title too short for ASIN', asin, '- candidates:', titleCandidates.map((c) => c.text.slice(0, 40)));
+        return null;
+      }
+      if (best && best.selector !== 'anchor-aria-label') {
+        log('Title found via:', best.selector, `(${best.len} chars)`);
+      }
 
       const price = amazonPrice(node);
       if (price == null) { warn('No valid price for:', title); return null; } // out of stock / unavailable -> not buyable
@@ -742,25 +947,51 @@ function sleepPaced(ms, run) {
     return Math.min.apply(null, amounts);
   }
 
-  /** Extract image URL from eBay card. */
+  /**
+   * Extract image URL from eBay card.
+   * FIXED: Handles <picture> elements, <source> srcset, lazy-loaded images,
+   * data-src/data-lazy-src attributes, and upgrades to a higher-res URL.
+   */
   function ebayImage(node) {
-    // Primary: first image in the carousel
+    // 1) Try <picture> <source> elements first (eBay's new lazy-loading pattern)
+    const pictureSource = node.querySelector('picture source[srcset], picture source[data-srcset]');
+    if (pictureSource) {
+      const srcset = pictureSource.getAttribute('srcset') || pictureSource.getAttribute('data-srcset') || '';
+      const url = firstUrlFromSrcset(srcset);
+      if (/^https?:\/\//.test(url) && !/\/svg\//.test(url)) {
+        return url.replace(/\/s-l(?:64|96|140|225)\./, '/s-l300.');
+      }
+    }
+
+    // 2) Try <img> elements with multiple selector strategies
     const imgSelectors = [
       '.su-media-carousel img.s-card__image',
       '.su-image img',
       'img.s-card__image',
       'img[src*="i.ebayimg.com"]',
       '.s-item__image-wrapper img',
-      'img.s-item__image'
+      'img.s-item__image',
+      'img[data-src*="i.ebayimg.com"]',
+      'img[data-lazy-src*="i.ebayimg.com"]',
+      'img[srcset*="i.ebayimg.com"]',
+      'img[data-srcset*="i.ebayimg.com"]',
+      'img[alt]'
     ];
+
     let img = null;
+    let matchedSel = null;
     for (const selector of imgSelectors) {
       img = node.querySelector(selector);
-      if (img) break;
+      if (img) { matchedSel = selector; break; }
     }
     if (!img) return null;
-    const raw = img.currentSrc || img.src || (img.dataset && img.dataset.src) || '';
-    if (/^https?:\/\//.test(raw) && !/\/svg\//.test(raw)) return raw;
+
+    // 3) Extract URL from the image element using all known attribute sources
+    const raw = imageUrlFromElement(img).replace(/\/s-l(?:64|96|140|225)\./, '/s-l300.');
+    if (/^https?:\/\//.test(raw) && !/\/svg\//.test(raw)) {
+      log('eBay image found via:', matchedSel);
+      return raw;
+    }
     return null;
   }
 
@@ -987,6 +1218,97 @@ function sleepPaced(ms, run) {
     return [];
   }
 
+  /**
+   * Detect the total number of available pages from eBay's pagination controls.
+   *
+   * Strategy:
+   *   1. Collect every pagination item's text or aria-label (e.g. "1", "2",
+   *      "…", "Next"). The highest numeric value seen is the max page.
+   *   2. If a "Next" button is still present beyond the highest number shown
+   *      (eBay sometimes clips the last digit), assume max + 1.
+   *   3. Fall back to scanning anchor hrefs carrying the `_pgn=` page param.
+   *
+   * Returns null when the pagination element is missing or malformed so the
+   * caller can fall back to a safe default instead of looping forever.
+   */
+  function ebayMaxPage() {
+    try {
+      const numbers = new Set();
+      let sawNext = false;
+
+      // 1) Primary: numbered pagination items (ol.pagination__items is eBay's
+      //    classic pager; .x-pagination is the newer layout).
+      const pagerSelectors = [
+        'ol.pagination__items li',
+        '.pagination__items li',
+        '.srp-controls__pagination li',
+        '.x-pagination li',
+        'nav.pagination li',
+        'div.pagination li',
+        'li[class*="pagination"]'
+      ];
+      for (const sel of pagerSelectors) {
+        try {
+          const nodes = document.querySelectorAll(sel);
+          if (!nodes.length) continue;
+          for (const n of nodes) {
+            const t = (n.textContent || '').replace(/\s+/g, ' ').trim();
+            const asNum = parseInt(t, 10);
+            if (Number.isInteger(asNum) && asNum > 0 && asNum <= 500) {
+              numbers.add(asNum);
+            }
+            const label = (n.getAttribute && n.getAttribute('aria-label')) || '';
+            if (/next/i.test(t) || /next/i.test(label)) sawNext = true;
+          }
+        } catch (_) { /* ignore selector errors */ }
+      }
+
+      if (numbers.size) {
+        const max = Math.max(...numbers);
+        return sawNext ? max + 1 : max;
+      }
+
+      // 2) Fallback: scrape page numbers from pagination anchors / _pgn= hrefs.
+      try {
+        const linkSelectors = [
+          'ol.pagination__items a[href]',
+          '.pagination a[href]',
+          '.srp-controls__pagination a[href]',
+          'li.pagination__item a[href]',
+          'a[href*="_pgn="]'
+        ];
+        for (const sel of linkSelectors) {
+          const links = document.querySelectorAll(sel);
+          if (!links.length) continue;
+          for (const a of links) {
+            const label = (a.getAttribute('aria-label') || a.textContent || '').replace(/\s+/g, ' ').trim();
+            const m = label.match(/(?:page\s*)?(\d{1,3})/i);
+            if (m) {
+              const asNum = parseInt(m[1], 10);
+              if (Number.isInteger(asNum) && asNum > 0 && asNum <= 500) numbers.add(asNum);
+            }
+          }
+          if (numbers.size) break;
+        }
+      } catch (_) { /* ignore */ }
+
+      if (numbers.size) {
+        const max = Math.max(...numbers);
+        const hasNext = document.querySelector(
+          '.pagination__next, .pagination__next[href], a[aria-label*="next" i], button.pagination__next, [class*="pagination__next"]'
+        );
+        return hasNext ? max + 1 : max;
+      }
+
+      // 3) Nothing usable found — caller decides the fallback.
+      log('eBay pagination element not found - maxPage unknown');
+      return null;
+    } catch (e) {
+      warn('ebayMaxPage error:', e.message);
+      return null;
+    }
+  }
+
   function extractEbay() {
     const items = [];
     const seen = new Set();
@@ -1067,7 +1389,14 @@ function sleepPaced(ms, run) {
 
       if (isBlockedPage()) { report(run, { error: 'blocked' }); return; }
 
-      const items = SITE === 'amazon' ? extractAmazon() : extractEbay();
+      let items = [];
+      try {
+        items = SITE === 'amazon' ? extractAmazon() : extractEbay();
+      } catch (e) {
+        warn('Extraction error:', e.message);
+        report(run, { error: 'parse-failed' });
+        return;
+      }
 
       if (!items.length) {
         if (SITE === 'amazon') {
@@ -1089,7 +1418,15 @@ function sleepPaced(ms, run) {
       }
 
       await humanPause(run, CFG.pauseMinMs, CFG.pauseMaxMs);
-      report(run, { items });
+      if (SITE === 'ebay') {
+        // Report how many pages eBay exposed so background.js can iterate all
+        // of them dynamically (instead of stopping at a hardcoded page count).
+        const maxPage = ebayMaxPage();
+        log('eBay max page detected:', maxPage);
+        report(run, { items, maxPage });
+      } else {
+        report(run, { items });
+      }
     })();
 
     try {
