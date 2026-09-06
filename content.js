@@ -212,7 +212,7 @@ function sleepPaced(ms, run) {
   }
 
   /* ------------------------------------------------------------------ *
-   * AMAZON extraction
+   * AMAZON extraction (unchanged)
    * ------------------------------------------------------------------ */
 
   /** Pull the 10-char ASIN out of any Amazon product URL. */
@@ -644,17 +644,17 @@ function sleepPaced(ms, run) {
   }
 
 /* ------------------------------------------------------------------ *
- * EBAY extraction
+ * EBAY extraction — FIXED for new .s-card layout
  * ------------------------------------------------------------------ */
 
   /** Wait for eBay results grid to render (bounded, like Amazon). */
   function waitEbayGrid(run) {
     const gridSelectors = [
-      'li.s-item',
+      'li.s-card',           // primary new layout
+      'li.s-item',           // old layout fallback
       'div.s-card',
       'ul.srp-results li',
       '.s-item__wrapper',
-      // NEW: Additional modern selectors for 2024-2025 layouts
       'div[data-testid="search-result"]',
       'article.s-item',
       'div[class*="srp-grid"]'
@@ -719,6 +719,7 @@ function sleepPaced(ms, run) {
     });
   }
 
+  /** Clean eBay title by removing common prefixes. */
   function cleanEbayTitle(t) {
     let s = (t || '').replace(/\s+/g, ' ').trim();
     // Strip eBay list chrome prefixes ("New Listing", "Results for ...", ...)
@@ -727,7 +728,8 @@ function sleepPaced(ms, run) {
     return s;
   }
 
-  /** eBay price may be "US $12.99", "C $15.00", "$9.99 to $14.99", etc. */
+  /** eBay price may be "US $12.99", "C $15.00", "$9.99 to $14.99", etc.
+   *  Returns the lowest price in USD, ignoring non-USD currencies. */
   function parseEbayPrice(text) {
     if (!text) return null;
     // Skip non-USD money (CAD "C $", GBP £, EUR €, AUD "A $", ...)
@@ -740,13 +742,16 @@ function sleepPaced(ms, run) {
     return Math.min.apply(null, amounts);
   }
 
+  /** Extract image URL from eBay card. */
   function ebayImage(node) {
+    // Primary: first image in the carousel
     const imgSelectors = [
+      '.su-media-carousel img.s-card__image',
+      '.su-image img',
+      'img.s-card__image',
+      'img[src*="i.ebayimg.com"]',
       '.s-item__image-wrapper img',
-      'img.s-item__image',
-      'div[class*="image"] img',
-      '.s-item__image img',
-      'img[src*="i.ebayimg.com"]'
+      'img.s-item__image'
     ];
     let img = null;
     for (const selector of imgSelectors) {
@@ -759,279 +764,226 @@ function sleepPaced(ms, run) {
     return null;
   }
 
+  /** Parse a single eBay product card (li.s-card or similar). */
   function parseEbayNode(node) {
     try {
-      // Multiple anchor selector strategies for eBay
+      // --- 1. Find the main link (product URL) ---
       const anchorSelectors = [
-        'a.s-item__link[href]',
+        'a.s-card__link[href*="/itm/"]',
         'a[href*="/itm/"]',
-        'a[class*="s-item__link"]',
-        // NEW: Additional patterns for modern layouts
-        'div.s-item a[href*="/itm/"]',
-        'article.s-item a[href]',
-        // Fallback: any anchor in the node with /itm/ href
-        'a[href]'
+        'a.s-item__link[href]'
       ];
-      
       let anchor = null;
       for (const selector of anchorSelectors) {
         anchor = node.querySelector(selector);
         if (anchor && anchor.href && anchor.href.includes('/itm/')) break;
       }
-      
-      // Last resort: scan all anchors in node for /itm/ pattern
+      // Fallback: scan all anchors in the node
       if (!anchor || !anchor.href || !anchor.href.includes('/itm/')) {
         const allAnchors = node.querySelectorAll('a[href]');
         for (const a of allAnchors) {
           if (a.href && a.href.includes('/itm/')) {
             anchor = a;
-            log('eBay anchor found via full scan fallback');
             break;
           }
         }
       }
-      
-      if (!anchor) { 
-        log('eBay container has no valid anchor, checking node structure:', node.tagName, node.className);
-        return null; 
-      }
-      
-      const idMatch = anchor.href.match(/\/itm\/(\d{9,})/);
-      if (!idMatch) {
-        log('eBay anchor href does not contain valid item ID:', anchor.href);
+      if (!anchor) {
+        log('eBay container has no valid anchor');
         return null;
       }
-      const id = idMatch[1];
 
+      // --- 2. Extract item ID ---
+      let id = node.getAttribute('data-listingid');
+      if (!id) {
+        const match = anchor.href.match(/\/itm\/(\d{9,})/);
+        if (match) id = match[1];
+      }
+      if (!id) {
+        warn('eBay item ID not found');
+        return null;
+      }
+
+      // --- 3. Title ---
+      // New layout: .s-card__title span.su-styled-text.primary.default
       const titleSelectors = [
+        '.s-card__title span.su-styled-text.primary.default',
+        '.s-card__title',
         '.s-item__title',
         '.s-item__title span',
         'h3.s-item__title',
-        'span[role="heading"]',
-        '.s-item__title-text',
-        // NEW: Additional title patterns
-        'div.s-item__title h3',
-        '[data-testid="listing-title"]',
-        // Fallback: any heading element
-        'h1, h2, h3, h4, h5, h6'
+        'span[role="heading"]'
       ];
       let titleEl = null;
       for (const selector of titleSelectors) {
         titleEl = node.querySelector(selector);
         if (titleEl && titleEl.textContent.trim().length > 3) break;
       }
-      
-      // Fallback: use anchor text if no title element found
-      if (!titleEl) {
-        titleEl = anchor;
-        log('eBay title using anchor text as fallback');
-      }
-      
+      if (!titleEl) titleEl = anchor; // fallback
       const title = cleanEbayTitle(titleEl ? titleEl.textContent : anchor.title || '');
-      if (!title) { 
-        warn('No valid title for eBay item, anchor text:', anchor.textContent.slice(0, 100));
-        return null; 
+      if (!title) {
+        warn('No valid title for eBay item');
+        return null;
       }
 
+      // --- 4. Price ---
+      // New layout: .s-card__price (there may be multiple; take the first that has a number)
+      let price = null;
       const priceSelectors = [
+        '.s-card__price',
         '.s-item__price',
         'span[class*="price"]',
         '.x-price-primary',
         '.s-item__detail--primary span',
-        // NEW: Additional price patterns
-        '.s-item__detail .s-item__price',
-        'div[data-testid="item-price"]',
-        '.price-display',
-        // Fallback: any span/div with $ symbol
-        'span, div'
+        'div[data-testid="item-price"]'
       ];
-      let price = null;
-      let matchedPriceSel = null;
       for (const selector of priceSelectors) {
-        const priceEl = node.querySelector(selector);
-        if (priceEl) {
-          price = parseEbayPrice(priceEl.textContent);
-          if (price != null) { 
-            matchedPriceSel = selector; 
-            break; 
+        const elements = node.querySelectorAll(selector);
+        for (const el of elements) {
+          const p = parseEbayPrice(el.textContent);
+          if (p != null) {
+            price = p;
+            break;
           }
         }
+        if (price != null) break;
       }
-      if (matchedPriceSel) { log(`eBay price found via: ${matchedPriceSel}`); }
-      
-      // Last resort: scan the entire card text for a $ amount.
+
+      // Fallback: scan the entire card text for $ amounts.
       if (price == null) {
         const t = (node.innerText || '').slice(0, 800);
         if (/\$/.test(t) && !/[£€]/.test(t)) {
           price = parseEbayPrice(t);
-          if (price != null) log('eBay price extracted from full card text scan');
         }
       }
-      
-      if (price == null) { 
-        warn('No valid price for eBay item:', title.slice(0, 80)); 
-        return null; 
+      if (price == null) {
+        warn('No valid price for eBay item:', title.slice(0, 80));
+        return null;
       }
 
+      // --- 5. Condition ---
       const condSelectors = [
+        '.s-card__subtitle span.su-styled-text.secondary.default',
         '.s-item__condition',
         '.s-item__subtitle',
         'span.SECONDARY_INFO',
         '.s-item__condition-text',
         '.x-item-condition',
-        // NEW: Additional condition patterns
-        'div[itemprop="itemCondition"]',
-        '[data-testid="item-condition"]'
+        'div[itemprop="itemCondition"]'
       ];
       let condEl = null;
       for (const selector of condSelectors) {
         condEl = node.querySelector(selector);
         if (condEl && condEl.textContent.trim().length > 1) break;
       }
+      const condition = condEl ? condEl.textContent.replace(/\s+/g, ' ').trim().slice(0, 60) : '';
 
+      // --- 6. Image ---
+      const image = ebayImage(node);
+
+      // --- 7. Build result ---
+      log('Parsed eBay item:', { id, title: title.slice(0, 50), price, condition });
       return {
         id,
         site: 'ebay',
         title,
         price,
         priceText: `$${price.toFixed(2)}`,
-        image: ebayImage(node),
+        image,
         url: `https://www.ebay.com/itm/${id}`,
         rating: null,
-        condition: condEl ? condEl.textContent.replace(/\s+/g, ' ').trim().slice(0, 60) : ''
+        condition
       };
-    } catch (e) { 
-      warn('parseEbayNode error:', e.message, 'node:', node.tagName); 
-      return null; 
+    } catch (e) {
+      warn('parseEbayNode error:', e.message);
+      return null;
     }
   }
 
+  /** Collect all product container nodes from the eBay search results page. */
   function ebayContainers() {
-    // CRITICAL FIX: Collect ALL nodes from ALL selector strategies, not just the first match.
-    // Use a Map keyed by item ID to deduplicate while maximizing coverage.
+    // Use a Map keyed by item ID to deduplicate.
     const byId = new Map();
     let totalFound = 0;
 
-    // Strategy A: classic river layout (li.s-item)
-    try {
-      const nodes = Array.from(document.querySelectorAll('li.s-item'));
-      if (nodes.length > 0) {
-        log(`eBay strategy "classic-river" matched ${nodes.length} nodes`);
-        totalFound += nodes.length;
-        for (const n of nodes) {
-          const anchor = n.querySelector('a[href*="/itm/"]');
-          if (!anchor) continue;
-          const m = anchor.href.match(/\/itm\/(\d{9,})/);
-          if (m && !byId.has(m[1])) {
-            byId.set(m[1], n);
+    // Strategy A: new .s-card layout (horizontal and vertical)
+    const cardSelectors = [
+      'li.s-card',
+      'div.s-card',
+      'li.s-card--horizontal',
+      'li.s-card--vertical',
+      'div[data-testid="search-result"]',
+      'article.s-item'
+    ];
+    for (const sel of cardSelectors) {
+      try {
+        const nodes = Array.from(document.querySelectorAll(sel));
+        if (nodes.length > 0) {
+          log(`eBay selector "${sel}" matched ${nodes.length} nodes`);
+          totalFound += nodes.length;
+          for (const n of nodes) {
+            const id = n.getAttribute('data-listingid');
+            if (id && !byId.has(id)) {
+              // Verify it has a link to a product
+              if (n.querySelector('a[href*="/itm/"]')) {
+                byId.set(id, n);
+              }
+            }
           }
         }
-      }
-    } catch (e) {
-      warn('Selector error in strategy "classic-river":', e.message);
+      } catch (_) { /* ignore */ }
     }
 
-    // Strategy B: newer card grid layout
-    try {
-      const nodes = Array.from(document.querySelectorAll('div.s-card, div[class*="s-card"], ul.srp-results li, li.s-item, div.srp-results li'));
-      if (nodes.length > 0) {
-        log(`eBay strategy "card-grid" matched ${nodes.length} nodes`);
-        totalFound += nodes.length;
-        for (const n of nodes) {
-          const anchor = n.querySelector('a[href*="/itm/"]');
-          if (!anchor) continue;
-          const m = anchor.href.match(/\/itm\/(\d{9,})/);
-          if (m && !byId.has(m[1])) {
-            byId.set(m[1], n);
-          }
-        }
-      }
-    } catch (e) {
-      warn('Selector error in strategy "card-grid":', e.message);
-    }
-
-    // Strategy C: data-testid based containers (modern eBay)
-    try {
-      const nodes = Array.from(document.querySelectorAll('div[data-testid="search-result"], article.s-item'));
-      if (nodes.length > 0) {
-        log(`eBay strategy "data-testid" matched ${nodes.length} nodes`);
-        totalFound += nodes.length;
-        for (const n of nodes) {
-          const anchor = n.querySelector('a[href*="/itm/"]');
-          if (!anchor) continue;
-          const m = anchor.href.match(/\/itm\/(\d{9,})/);
-          if (m && !byId.has(m[1])) {
-            byId.set(m[1], n);
-          }
-        }
-      }
-    } catch (e) {
-      warn('Selector error in strategy "data-testid":', e.message);
-    }
-
-    // Strategy D: wrapper-based selection
-    try {
-      const nodes = Array.from(document.querySelectorAll('.s-item__wrapper, div.s-item'));
-      if (nodes.length > 0) {
-        log(`eBay strategy "wrapper" matched ${nodes.length} nodes`);
-        totalFound += nodes.length;
-        for (const n of nodes) {
-          const anchor = n.querySelector('a[href*="/itm/"]');
-          if (!anchor) continue;
-          const m = anchor.href.match(/\/itm\/(\d{9,})/);
-          if (m && !byId.has(m[1])) {
-            byId.set(m[1], n);
-          }
-        }
-      }
-    } catch (e) {
-      warn('Selector error in strategy "wrapper":', e.message);
-    }
-
-    // Return collected items if we found a reasonable amount
     if (byId.size >= 2) {
       log(`Total unique eBay items found: ${byId.size} (from ${totalFound} raw matches)`);
       return Array.from(byId.values());
     }
 
-    // Strategy E: generic anchor-based fallback (layout fully changed)
-    log('Attempting anchor-based fallback...');
-    document.querySelectorAll('a[href*="/itm/"]').forEach((a) => {
-      const m = a.href.match(/\/itm\/(\d{9,})/);
-      if (!m || byId.has(m[1])) return;
-      // Try multiple wrapper patterns with increasing specificity
-      const wrap = a.closest('li, div[class*="s-card"], div[class*="s-item"], div[class*="srp"], div.s-item__wrapper, article.s-item, div[data-testid="search-result"]') || a;
-      byId.set(m[1], wrap);
-    });
-    log(`eBay anchor fallback found ${byId.size} unique item IDs`);
-    
-    if (byId.size > 0) {
+    // Strategy B: fallback – old .s-item or generic list items
+    const fallbackSelectors = [
+      'li.s-item',
+      'ul.srp-results li',
+      'div.s-item__wrapper'
+    ];
+    for (const sel of fallbackSelectors) {
+      try {
+        const nodes = Array.from(document.querySelectorAll(sel));
+        if (nodes.length > 0) {
+          log(`eBay fallback selector "${sel}" matched ${nodes.length} nodes`);
+          for (const n of nodes) {
+            const anchor = n.querySelector('a[href*="/itm/"]');
+            if (!anchor) continue;
+            const match = anchor.href.match(/\/itm\/(\d{9,})/);
+            if (match && !byId.has(match[1])) {
+              byId.set(match[1], n);
+            }
+          }
+        }
+      } catch (_) { /* ignore */ }
+    }
+
+    if (byId.size >= 2) {
+      log(`eBay fallback found ${byId.size} unique items`);
       return Array.from(byId.values());
     }
-    
-    // Strategy F: Last resort - find any element containing an /itm/ link
-    const lastResort = [];
+
+    // Strategy C: last-resort – any container with an /itm/ link
+    log('Attempting eBay anchor-based fallback...');
     document.querySelectorAll('a[href*="/itm/"]').forEach((a) => {
-      const m = a.href.match(/\/itm\/(\d{9,})/);
-      if (!m) return;
-      const id = m[1];
-      if (lastResort.some(n => n.dataset && n.dataset.ebayId === id)) return;
-      
+      const match = a.href.match(/\/itm\/(\d{9,})/);
+      if (!match || byId.has(match[1])) return;
       // Find the closest reasonable container
-      let container = a.closest('ul, ol, div[class*="list"], div[class*="grid"], section, main');
-      if (!container) container = a.parentElement;
-      if (!container) return;
-      
-      // Mark it to avoid duplicates
-      container.dataset.ebayId = id;
-      lastResort.push(container);
+      const container = a.closest('li, div[class*="s-card"], div[class*="s-item"], div[class*="srp"], article, div[data-testid="search-result"]') || a.parentElement;
+      if (container) {
+        byId.set(match[1], container);
+      }
     });
-    
-    if (lastResort.length > 0) {
-      log(`eBay last-resort container scan found ${lastResort.length} items`);
-      return lastResort;
+
+    if (byId.size > 0) {
+      log(`eBay anchor fallback found ${byId.size} items`);
+      return Array.from(byId.values());
     }
-    
+
     return [];
   }
 
@@ -1049,13 +1001,11 @@ function sleepPaced(ms, run) {
   }
 
   /* ------------------------------------------------------------------ *
-   * Orchestration
+   * Orchestration (unchanged)
    * ------------------------------------------------------------------ */
-  let autoRan = false; // one automatic attempt per page load, per instance
+  let autoRan = false;
 
   function report(run, payload) {
-    // A superseded (killed or re-injected) run must never report — its late
-    // messages are exactly what confused the orchestrator before.
     if (!isCurrent(run)) return;
     const msg = Object.assign({
       type: 'ARB_RESULTS',
@@ -1068,57 +1018,42 @@ function sleepPaced(ms, run) {
       error: null
     }, payload);
     try {
-      if (!chrome.runtime || !chrome.runtime.id) return; // extension reloaded
+      if (!chrome.runtime || !chrome.runtime.id) return;
       chrome.runtime.sendMessage(msg).catch(() => {});
     } catch (_) { /* ignore */ }
   }
 
-  /**
-   * One full scrape attempt, hard-bounded by CFG.scrapeDeadlineMs.
-   * The deadline race is what guarantees the popup can never spin forever on
-   * our account: every await below (pacing, scrolling, grid wait) completes
-   * or the run reports a timeout error.
-   */
   async function runScrape(opts) {
     opts = opts || {};
-    if (currentRun && isCurrent(currentRun)) killCurrent(); // abort any in-flight run
+    if (currentRun && isCurrent(currentRun)) killCurrent();
     const run = makeRun();
 
     const work = (async () => {
       if (isBlockedPage()) { report(run, { error: 'blocked' }); return; }
 
-      // Human-like pacing BEFORE parsing — but only when the user can see the
-      // tab. A backgrounded tab skips straight to parsing so a hidden scrape
-      // finishes in ~1s instead of idling through the full delay chain.
-      // Reduced delays to leave more time for grid wait within the deadline.
       if (!document.hidden) {
         await humanPause(run, CFG.preParseMinMs, CFG.preParseMaxMs);
         if (!isCurrent(run)) return;
         await humanScroll(run);
         if (!isCurrent(run)) return;
-        // Extra settle pause after scrolling to let lazy-loaded images/containers render
         await humanPause(run, 200, 400);
         if (!isCurrent(run)) return;
       }
 
-      // Amazon renders results client-side/lazy: wait (bounded) for the grid.
       if (SITE === 'amazon') {
         const gridReady = await waitAmazonGrid(run);
         if (!isCurrent(run)) return;
         if (isBlockedPage()) { report(run, { error: 'blocked' }); return; }
         if (!gridReady) {
-          // Check if we're on a "no results" page vs a page that failed to load
           const noResultsEl = document.querySelector('.s-no-results, #noResultsTitle, .a-alert-heading, [data-component-type="s-no-results"]');
           if (noResultsEl && /no results|did not match|try checking|no products found/i.test(noResultsEl.textContent)) {
             report(run, { error: 'no-results' });
           } else {
-            // Page loaded but grid didn't appear - likely layout change or partial load
             report(run, { error: 'parse-failed' });
           }
           return;
         }
       }
-      // eBay also benefits from bounded grid wait
       if (SITE === 'ebay') {
         const gridReady = await waitEbayGrid(run);
         if (!isCurrent(run)) return;
@@ -1135,7 +1070,6 @@ function sleepPaced(ms, run) {
       const items = SITE === 'amazon' ? extractAmazon() : extractEbay();
 
       if (!items.length) {
-        // For Amazon, double-check if it's a genuine no-results vs parsing failure
         if (SITE === 'amazon') {
           const hasProductLinks = document.querySelectorAll('a[href*="/dp/"], a[href*="/gp/product/"]').length > 0;
           if (hasProductLinks) {
@@ -1144,7 +1078,6 @@ function sleepPaced(ms, run) {
             report(run, { error: 'no-results' });
           }
         } else {
-          // For eBay, check if product links exist but parsing failed
           const hasProductLinks = document.querySelectorAll('a[href*="/itm/"]').length > 0;
           if (hasProductLinks) {
             report(run, { error: 'parse-failed' });
@@ -1155,7 +1088,6 @@ function sleepPaced(ms, run) {
         return;
       }
 
-      // Tiny settle pause before reporting (kept interruptible + short).
       await humanPause(run, CFG.pauseMinMs, CFG.pauseMaxMs);
       report(run, { items });
     })();
@@ -1164,7 +1096,6 @@ function sleepPaced(ms, run) {
       await withTimeout(work, CFG.scrapeDeadlineMs, 'scrape');
       if (isCurrent(run)) killCurrent();
     } catch (err) {
-      // Deadline exceeded or an unexpected throw: fail LOUDLY, not silently.
       const reason = err instanceof Error && /^timeout:/.test(err.message)
         ? 'timeout'
         : 'parse-failed';
@@ -1173,11 +1104,6 @@ function sleepPaced(ms, run) {
     }
   }
 
-  /**
-   * The popup's "Parse again" button asks us to re-run immediately.
-   * We only honour requests whose runId matches ours, so a stale instance
-   * cannot answer a call meant for a newer one (and vice versa).
-   */
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (!msg || msg.type !== 'ARB_SCRAPE_NOW') return false;
     if (msg.runId && currentRun && msg.runId !== currentRun.id) return false;
@@ -1186,8 +1112,6 @@ function sleepPaced(ms, run) {
     return false;
   });
 
-  // Not a search-results page -> report that explicitly (background tags the
-  // stage 'no-results-page' instead of waiting on a page that will never report).
   if (!isSearchPath) {
     report(makeRun(), { error: 'no-results-page' });
     return;
@@ -1196,9 +1120,6 @@ function sleepPaced(ms, run) {
   if (!QUERY) { report(makeRun(), { error: 'no-query' }); return; }
   if (isBlockedPage()) { report(makeRun(), { error: 'blocked' }); return; }
 
-  // Kick off the automatic scrape as soon as the DOM is interactive — the
-  // bounded grid wait handles the rest (no need to wait for full load, which
-  // tracking pixels can delay indefinitely).
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => runScrape({ force: false }));
   } else {
