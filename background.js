@@ -59,7 +59,9 @@ const EBAY_FALLBACK_MAX_PAGES = 3;
 // Hard safety ceiling so a malformed pagination element can't cause an
 // unbounded loop. eBay typically caps search pagination at 100 pages.
 const EBAY_ABSOLUTE_MAX_PAGES = 100;
-const AMAZON_MAX_PAGES = 5;
+const AMAZON_ABSOLUTE_MAX_PAGES = 20;
+// Default user-configurable page limit when the popup doesn't send one.
+const DEFAULT_PAGE_LIMIT = 3;
 // Rate-limit / anti-blocking delays between Amazon page navigations (ms).
 const AMAZON_PAGE_DELAY_MIN_MS = 800;
 const AMAZON_PAGE_DELAY_MAX_MS = 3000;
@@ -90,10 +92,11 @@ function emptySiteState() {
   return { status: 'idle', items: [], error: null, tabId: null, url: null, page: 1, pagesDone: 0, maxPage: null };
 }
 
-function newRunState(query, runId) {
+function newRunState(query, runId, pageLimit) {
   return {
     runId,
     query,
+    pageLimit: Math.max(1, Math.min(20, Math.floor(Number(pageLimit)) || DEFAULT_PAGE_LIMIT)),
     // A brand-new state is ALWAYS idle. 'searching' is only ever entered by an
     // explicit user command (startRun from the Compare click, forceParse from
     // "Parse again"). Booting into 'searching' here used to make the popup's
@@ -197,10 +200,10 @@ async function handleStageTimeout(runId, site) {
  * ARB_FORCE_PARSE from the "Parse again" button. Nothing on popup-open can
  * reach this function.
  */
-async function startRun(query) {
+async function startRun(query, pageLimit) {
   await ensureState();
   const old = cache;
-  cache = newRunState(query, `r${Date.now()}`);
+  cache = newRunState(query, `r${Date.now()}`, pageLimit);
   cache.phase = 'searching'; // explicit, user-commanded transition
   cache.startedAt = Date.now();
 
@@ -301,16 +304,27 @@ function dedupeItems(items) {
 async function continueEbayPagination() {
   const ss = cache.sites.ebay;
 
+  // User-configured page limit (from the popup's "Pages per site" input,
+  // default 3). This is the PRIMARY cap — the user explicitly said how many
+  // pages they want scraped so long jobs finish faster.
+  const userLimit = Number.isInteger(cache.pageLimit) && cache.pageLimit > 0
+    ? cache.pageLimit
+    : DEFAULT_PAGE_LIMIT;
+
   // Dynamic page limit: use the max page reported by content.js from eBay's
-  // own pagination controls. Falls back to EBAY_FALLBACK_MAX_PAGES (3) when
-  // the pagination element was missing/malformed, and is hard-capped by
-  // EBAY_ABSOLUTE_MAX_PAGES so a corrupted page number can't cause an
-  // unbounded scrape.
+  // own pagination controls, THEN intersect with the user's limit. Falls
+  // back to EBAY_FALLBACK_MAX_PAGES (3) when the pagination element was
+  // missing/malformed, and is hard-capped by EBAY_ABSOLUTE_MAX_PAGES so a
+  // corrupted page number can't cause an unbounded scrape.
   const detectedMax = Number.isInteger(ss.maxPage) && ss.maxPage > 0
     ? ss.maxPage
     : EBAY_FALLBACK_MAX_PAGES;
-  const ebayMaxPages = Math.min(detectedMax, EBAY_ABSOLUTE_MAX_PAGES);
-  console.log(`[arb] eBay pagination: current=${ss.page}, maxPages=${ebayMaxPages}${Number.isInteger(ss.maxPage) ? ` (detected=${ss.maxPage})` : ' (fallback)'}`);
+  const ebayMaxPages = Math.min(
+    detectedMax,
+    EBAY_ABSOLUTE_MAX_PAGES,
+    userLimit
+  );
+  console.log(`[arb] eBay pagination: current=${ss.page}, maxPages=${ebayMaxPages} (user=${userLimit}, detected=${Number.isInteger(ss.maxPage) ? ss.maxPage : 'n/a'})`);
 
   const nextPage = (ss.page || 1) + 1;
   if (nextPage <= ebayMaxPages) {
@@ -330,8 +344,19 @@ async function continueEbayPagination() {
 
 async function continueAmazonPagination() {
   const ss = cache.sites.amazon;
+
+  // User-configured Amazon page limit (same "Pages per site" input as eBay).
+  // Intersect with the hard 20-page safety ceiling so a malformed value can
+  // never cause an unbounded scrape.
+  const userLimit = Number.isInteger(cache.pageLimit) && cache.pageLimit > 0
+    ? cache.pageLimit
+    : DEFAULT_PAGE_LIMIT;
+  const amazonMaxPages = Math.min(
+    AMAZON_ABSOLUTE_MAX_PAGES,
+    userLimit
+  );
   const nextPage = (ss.page || 1) + 1;
-  if (nextPage <= AMAZON_MAX_PAGES) {
+  if (nextPage <= amazonMaxPages) {
     // Rate-limit handling: add a random human-like delay between Amazon page
     // navigations to avoid triggering bot detection.
     const delayMs = AMAZON_PAGE_DELAY_MIN_MS +
@@ -655,7 +680,8 @@ async function handleMessage(msg, sender) {
     case 'ARB_START': {
       const query = String(msg.query || '').trim();
       if (query.length < 2) return { error: 'Query too short' };
-      await startRun(query);
+      const pageLimit = Math.floor(Number(msg.pageLimit));
+      await startRun(query, pageLimit);
       return {};
     }
     case 'ARB_GET_STATE': {

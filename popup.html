@@ -27,7 +27,7 @@
     * { box-sizing: border-box; }
     html, body { margin: 0; }
     body {
-      width: 780px;
+      width: 920px;
       max-width: 100vw;
       background: var(--bg);
       color: var(--text);
@@ -69,6 +69,24 @@
     }
     #btnCompare:hover { background: var(--accent-dark); }
     #btnCompare:disabled { opacity: .55; cursor: default; }
+
+    .settings-row {
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+      padding: 2px 14px 4px;
+    }
+    .page-limit {
+      display: inline-flex; align-items: center; gap: 6px;
+      color: var(--muted); font-size: 12.5px; font-weight: 500;
+    }
+    .page-limit input {
+      width: 54px; padding: 4px 6px; border: 1px solid var(--border);
+      border-radius: 6px; font-size: 13px; text-align: right;
+    }
+    .page-limit input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(79, 70, 229, .13); outline: none;
+    }
+    .page-limit .hint { color: var(--muted); font-size: 11px; font-weight: 400; }
 
     .panel {
       display: flex; align-items: center; gap: 12px;
@@ -124,7 +142,7 @@
 
     .tablewrap {
       border: 1px solid var(--border); border-radius: 10px; overflow: auto;
-      background: var(--panel); max-height: 380px;
+      background: var(--panel); max-height: 520px;
     }
     table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
     thead th {
@@ -140,23 +158,32 @@
     tbody tr:hover { background: #fafaff; }
     td.num, th.num { text-align: right; }
     td.money { font-variant-numeric: tabular-nums; white-space: nowrap; }
-    .prod { display: flex; gap: 8px; align-items: flex-start; max-width: 230px; }
-    .prod img {
-      width: 34px; height: 34px; object-fit: contain; flex: 0 0 34px;
-      border: 1px solid var(--border); border-radius: 6px; background: #fff;
+    .prod {
+      display: flex; flex-direction: column; gap: 7px; align-items: flex-start;
+      max-width: 240px; min-width: 130px;
+    }
+    .prod .img-wrap {
+      width: 120px; height: 120px; flex: 0 0 120px;
+      display: flex; align-items: center; justify-content: center;
+      background: #fff; border: 1px solid var(--border); border-radius: 8px;
+      overflow: hidden; box-shadow: 0 1px 3px rgba(28, 35, 51, .05);
+    }
+    .prod .img-wrap img {
+      width: 100%; height: 100%; object-fit: contain; display: block;
     }
     .prod .ph {
-      width: 34px; height: 34px; flex: 0 0 34px; border-radius: 6px;
+      width: 118px; height: 118px; border-radius: 7px;
       background: #eef0f6; display: inline-flex; align-items: center;
-      justify-content: center; font-weight: 700; color: var(--muted);
+      justify-content: center; font-weight: 700; font-size: 30px;
+      color: var(--muted);
     }
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
-    .prod .t, .ebay-cell .t { font-weight: 550; }
+    .prod .t, .ebay-cell .t { font-weight: 550; font-size: 12.5px; line-height: 1.35; }
     .match {
       display: block; color: var(--muted); font-size: 11px; margin-top: 2px;
     }
-    .ebay-cell { max-width: 210px; }
+    .ebay-cell { max-width: 240px; }
     .ellipsis {
       display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
       overflow: hidden;
@@ -209,6 +236,14 @@
   <section class="search-row">
     <input id="q" type="search" placeholder='e.g. "Stanley 40 oz Quencher tumbler"' autocomplete="off" spellcheck="false" />
     <button id="btnCompare">Compare</button>
+  </section>
+
+  <section class="settings-row">
+    <label class="page-limit" title="Maximum number of search-result pages to scrape on each marketplace. Applies to both eBay and Amazon (1–20).">
+      Pages per site
+      <input id="pageLimit" type="number" min="1" max="20" step="1" value="3" inputmode="numeric" autocomplete="off" />
+      <span class="hint">eBay & Amazon</span>
+    </label>
   </section>
 
   <!-- Idle state: shown on popup open until the user clicks Compare. -->

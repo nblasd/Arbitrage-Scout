@@ -262,7 +262,7 @@ function sleepPaced(ms, run) {
   }
 
   /* ------------------------------------------------------------------ *
-   * AMAZON extraction (unchanged)
+   * AMAZON extraction (robust scoped selectors)
    * ------------------------------------------------------------------ */
 
   /** Pull the 10-char ASIN out of any Amazon product URL. */
@@ -306,7 +306,11 @@ function sleepPaced(ms, run) {
       'div.s-result-item[data-cy="asin-title"]',
       'div.a-section.s-result-card',
       'div[data-uuid]',  // Amazon's newer UUID-based containers
-      'article[data-asin]'  // Semantic HTML adoption
+      'article[data-asin]',  // Semantic HTML adoption
+      '[data-component-type="s-search-result-card"]',
+      'div[data-component="hasResult"]',
+      'div[data-csa-c-type="item"][data-csa-c-item-id]',
+      '[data-component-type="s-search-result"][data-asin]'
     ];
 
     const present = () => {
@@ -316,8 +320,10 @@ function sleepPaced(ms, run) {
           return true;
         }
       }
-      // Fallback: check if we have ANY product links even without proper containers
-      const productLinks = document.querySelectorAll('a[href*="/dp/"], a[href*="/gp/product/"], a[href*="/sspa/click/"]');
+      // Fallback: check if we have ANY product links even without proper containers.
+      // NOTE: no trailing slash after "click" — real sspa links are
+      // ".../sspa/click?ie=..." so "/sspa/click/" would never match.
+      const productLinks = document.querySelectorAll('a[href*="/dp/"], a[href*="/gp/product/"], a[href*="/sspa/click"]');
       if (productLinks.length >= 3) {
         log('Grid detection: Found', productLinks.length, 'product links without standard containers');
         return true;
@@ -370,98 +376,89 @@ function sleepPaced(ms, run) {
     });
   }
 
-  /** Robust sponsored detection for Amazon search results. */
+  /**
+   * Strong ad detection — only unambiguous, structural markers.
+   * NOTE: the old implementation rejected ANY card whose text/aria-label
+   * contained the substring "Ad" (e.g. "/* Ad taus" or "Add to cart"),
+   * and treated a distant ancestor carousel as proof-of-ad. Amazon cards
+   * routinely carry such markup, which nuked the organic grid down to a
+   * handful of survivors per page. This version uses only strong markers.
+   */
   function isAmazonSponsored(node) {
     if (!node) return false;
     if (node.matches && node.matches(
-      '.AdHolder, [data-ad-id], [data-component-type*="sponsored" i], ' +
+      '.AdHolder, [data-ad-id], [data-ad-placement], [data-ad-creative], ' +
+      '[data-ad-slot], [data-component-type*="sponsored" i], ' +
       '[data-cel-widget*="sponsored" i], [data-csa-c-type*="sponsored" i], ' +
-      '[data-csa-c-content-id*="sponsored" i], [data-csa-c-slot-id*="sponsored" i], ' +
-      '[data-ad-placement], [data-ad-creative], [data-ad-slot], ' +
-      '[aria-label*="Sponsored" i], [aria-label*="Ad" i]'
+      '[data-csa-c-content-id*="sponsored" i], [data-csa-c-slot-id*="sponsored" i]'
     )) return true;
     if (node.querySelector && node.querySelector(
-      '.AdHolder, [data-ad-id], [data-cy="ad-badge"], [aria-label*="Sponsored" i], ' +
+      '.AdHolder, [data-ad-id], [data-ad-placement], [data-ad-creative], ' +
+      '[data-ad-slot], [data-cy="ad-badge"], .ad-badge, ' +
       '[data-component-type*="sponsored" i], [data-cel-widget*="sponsored" i], ' +
       '[data-csa-c-type*="sponsored" i], [data-csa-c-content-id*="sponsored" i], ' +
-      '[data-csa-c-slot-id*="sponsored" i], [data-ad-placement], [data-ad-creative], ' +
-      '[data-ad-slot], [aria-label*="Ad" i], .p13n-asin, .p13n-sc-truncate, ' +
-      '.a-carousel-card[data-ad-id]'
+      '[data-csa-c-slot-id*="sponsored" i], .p13n-asin, .p13n-sc-truncate'
     )) return true;
-    const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 200);
-    if (/^sponsored\b/i.test(text) || /\bSponsored\s+Ad\b/i.test(text) || /\bAd\b\s*$/.test(text)) return true;
     if (node.querySelector) {
-      const links = node.querySelectorAll('a[href*="/sspa/click/"]');
+      const links = node.querySelectorAll('a[href*="/sspa/click"]');
       for (const a of links) {
-        const href = a.href || '';
+        // Prefer the resolved href, fall back to the raw attribute (some
+        // anchors — e.g. in detached/SVG trees — expose no .href property).
+        const href = a.href || (a.getAttribute && a.getAttribute('href')) || '';
         if (/[?&](?:adId|adGroupId|advertiserId|creativeId|adSlot)=/.test(href)) return true;
       }
     }
-    return false;
+    // Only a LEADING "Sponsored" text badge proves an ad card; never a
+    // substring in the middle/end of the label.
+    const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+    return /^sponsored(?:\s+ad)?\b/i.test(text);
   }
 
-  /** Robust carousel detection for Amazon search results. */
+  /**
+   * Robust carousel detection — scoped to the card itself or its DIRECT
+   * parent only. The old version scanned every ancestor (closest), so an
+   * organic card anywhere on a page that also had a "related items"
+   * carousel would be discarded. Amazon search returns DO include
+   * carousels, but they never CONTAIN the organic grid cards.
+   */
   function isAmazonCarousel(node) {
     if (!node) return false;
-    const carouselSelectors = [
-      '.a-carousel-container', '.a-carousel-card', '[data-a-carousel-options]',
-      '[data-cel-widget*="carousel" i]', '[class*="carousel" i]', '[id*="carousel" i]',
-      '[data-component-type*="carousel" i]', '.p13n-carousel', '.a-carousel-viewport',
-      '.a-carousel-row', '[data-csa-c-type="carousel"]', '[data-csa-c-slot-id*="carousel" i]',
-      '[data-cel-widget*="desktop-dp-sims" i]', '[data-cel-widget*="p13n" i]',
-      '.a-section[data-csa-c-type="widget"]'
-    ];
-    if (node.matches && node.matches(carouselSelectors.join(', '))) return true;
-    if (node.closest && node.closest(carouselSelectors.join(', '))) return true;
+    const sel = '.a-carousel-container, .a-carousel-card, .a-carousel-viewport, ' +
+      '.a-carousel-row, [data-a-carousel-options], [data-component-type*="carousel" i], ' +
+      '[data-csa-c-type="carousel"], .p13n-carousel';
+    if (node.matches && node.matches(sel)) return true;
+    const parent = node.parentElement;
+    if (parent && parent.matches && parent.matches(sel)) return true;
+    // Legacy "sims"/p13n wrappers are handled by the slot-scope filter and
+    // isAmazonRecommendationBlock — never by an ancestor scan here.
     return false;
   }
 
-  /** Filter Amazon recommendation/related-item blocks that are NOT organic results. */
+  /** Filter editorial / recommendation / related-blocks (never products). */
   function isAmazonRecommendationBlock(node) {
     if (!node) return false;
     const recSelectors = [
-      '[data-component-type="s-instant-results"]', '[data-component-type="s-related-keywords"]',
-      '[data-component-type="s-breadcrumb"]', '[data-component-type="s-suggestion"]',
-      '[data-component-type="s-quick-links"]', '[data-component-type="s-feedback"]',
-      '[data-component-type="s-pagination"]', '[data-component-type="s-refinements"]',
-      '[data-component-type="s-sort"]', '[data-component-type="s-filter"]',
-      '[data-component-type="s-banner"]', '[data-component-type="s-announcement"]',
-      '[data-component-type="s-inline-banner"]', '[data-component-type="s-inline-feedback"]',
-      '[data-component-type="s-inline-suggestion"]', '[data-component-type="s-inline-related"]',
-      '[data-component-type="s-inline-recommendation"]', '[data-component-type="s-inline-carousel"]',
-      '[data-component-type="s-inline-sponsored"]', '[data-component-type="s-inline-ad"]',
-      '[data-component-type="s-inline-promo"]', '[data-component-type="s-inline-offer"]',
-      '[data-component-type="s-inline-deal"]', '[data-component-type="s-inline-coupon"]',
-      '[data-component-type="s-inline-video"]', '[data-component-type="s-inline-image"]',
-      '[data-component-type="s-inline-text"]', '[data-component-type="s-inline-link"]',
-      '[data-component-type="s-inline-button"]', '[data-component-type="s-inline-input"]',
-      '[data-component-type="s-inline-select"]', '[data-component-type="s-inline-checkbox"]',
-      '[data-component-type="s-inline-radio"]', '[data-component-type="s-inline-range"]',
-      '[data-component-type="s-inline-slider"]', '[data-component-type="s-inline-toggle"]',
-      '[data-component-type="s-inline-switch"]', '[data-component-type="s-inline-progress"]',
-      '[data-component-type="s-inline-spinner"]', '[data-component-type="s-inline-loading"]',
-      '[data-component-type="s-inline-error"]', '[data-component-type="s-inline-warning"]',
-      '[data-component-type="s-inline-info"]', '[data-component-type="s-inline-success"]',
-      '[data-component-type="s-inline-message"]', '[data-component-type="s-inline-notification"]',
-      '[data-component-type="s-inline-alert"]', '[data-component-type="s-inline-toast"]',
-      '[data-component-type="s-inline-tooltip"]', '[data-component-type="s-inline-popover"]',
-      '[data-component-type="s-inline-modal"]', '[data-component-type="s-inline-dialog"]',
-      '[data-component-type="s-inline-panel"]', '[data-component-type="s-inline-section"]',
-      '[data-component-type="s-inline-divider"]', '[data-component-type="s-inline-spacer"]',
-      '[data-component-type="s-inline-separator"]', '[data-component-type="s-inline-rule"]',
-      '[data-component-type="s-inline-line"]', '[data-component-type="s-inline-border"]',
-      '[data-component-type="s-inline-shadow"]', '[data-component-type="s-inline-gradient"]',
-      '[data-component-type="s-inline-background"]', '[data-component-type="s-inline-foreground"]',
-      '[data-component-type="s-inline-color"]', '[data-component-type="s-inline-font"]',
-      '[data-component-type="s-inline-size"]', '[data-component-type="s-inline-weight"]',
-      '[data-component-type="s-inline-style"]', '[data-component-type="s-inline-class"]',
-      '[data-component-type="s-inline-id"]', '[data-component-type="s-inline-name"]',
-      '[data-component-type="s-inline-value"]', '[data-component-type="s-inline-key"]',
-      '[data-component-type="s-inline-param"]', '[data-component-type="s-inline-arg"]',
-      '[data-component-type="s-inline-option"]', '[data-component-type="s-inline-choice"]'
+      '[data-component-type="s-instant-results"]',
+      '[data-component-type="s-related-keywords"]',
+      '[data-component-type="s-breadcrumb"]',
+      '[data-component-type="s-suggestion"]',
+      '[data-component-type="s-quick-links"]',
+      '[data-component-type="s-feedback"]',
+      '[data-component-type="s-pagination"]',
+      '[data-component-type="s-refinements"]',
+      '[data-component-type="s-sort"]',
+      '[data-component-type="s-filter"]',
+      '[data-component-type="s-banner"]',
+      '[data-component-type="s-announcement"]',
+      '[data-component-type^="s-inline-"]',
+      '[data-component-type="widget-cpd"]',
+      '[data-component-type="sp-also-bought"]',
+      '[data-component-type="sp-related"]'
     ];
     if (node.matches && node.matches(recSelectors.join(', '))) return true;
     if (node.closest && node.closest(recSelectors.join(', '))) return true;
+    // id-based / class-based fallbacks for the "related"/suggestion rows.
+    if (node.id && /s-(suggestion|breadcrumb|pagination|refinements|quick-links|related)/i.test(node.id)) return true;
     return false;
   }
 
@@ -559,8 +556,26 @@ function sleepPaced(ms, run) {
             for (const node of nodes) {
               const asin = node.getAttribute('data-asin');
               if (asin && asin.length === 10 && !byAsin.has(asin)) {
-                // Verify this container has a product link
-                if (node.querySelector('a[href*="/dp/"], a[href*="/gp/product/"], a[href*="/sspa/click/"]')) {
+                // Stable organic results MUST live inside Amazon's main
+                // search-result slot. Carousels / related / sponsored /
+                // editorial widgets are rendered on other slots, so this
+                // single scope check drops the overwhelming majority of
+                // non-organic nodes before any per-card filter runs.
+                const scopeSel = '.s-main-slot, .s-search-results, .s-result-list, #search, .s-desktop-grid';
+                const inMainSlot = node.closest
+                  ? (node.closest(scopeSel) || (node.matches && node.matches(scopeSel)))
+                  : false;
+                // On A/B layouts where the slot wrapper is missing we still
+                // accept cards; the strong ad/carousel/rec filters below are
+                // then responsible for weeding out the rest.
+                const scopeAbsent = !document.querySelector('.s-main-slot, .s-search-results, .s-result-list, #search');
+                if (!inMainSlot && !scopeAbsent) {
+                  log('Skipping out-of-slot container:', asin);
+                  continue;
+                }
+
+                // Verify this container has a real product link.
+                if (node.querySelector('a[href*="/dp/"], a[href*="/gp/product/"], a[href*="/sspa/click"]')) {
                   if (isAmazonSponsored(node) || isAmazonCarousel(node) || isAmazonRecommendationBlock(node)) {
                     log('Skipping non-organic Amazon block:', asin);
                     continue;
@@ -586,7 +601,7 @@ function sleepPaced(ms, run) {
     const anchorSelectors = [
       'a[href*="/dp/"]',
       'a[href*="/gp/product/"]',
-      'a[href*="/sspa/click/"]',
+      'a[href*="/sspa/click"]',
       // NEW: aria-label based anchors (accessibility pattern)
       'a[aria-label*="product"][href]'
     ];
@@ -595,11 +610,18 @@ function sleepPaced(ms, run) {
       document.querySelectorAll(anchorSel).forEach((a) => {
         const asin = extractAsin(a.href);
         if (!asin || byAsin.has(asin)) return;
-        // Try multiple wrapper patterns with increasing specificity
-        const wrap = a.closest(
+        // Try match patterns with increasing specificity. Also respect the
+        // main-slot scope when it exists, so anchors living inside an inline
+        // carousel / related-item widget don't pollute the organic set.
+        let wrap = a.closest(
           'div[data-component-type="s-search-result"], div.s-result-item, div[data-asin][data-index], div[data-asin], div[class*="sg-col"], div.a-section, li, [data-cel-widget*="search"], article[data-asin], div[data-uuid]'
         ) || a;
-        byAsin.set(asin, wrap);
+        const scopeSel = '.s-main-slot, .s-search-results, .s-result-list, #search';
+        if (wrap.closest && !(wrap.closest(scopeSel) || wrap.matches(scopeSel))) {
+          const slotScope = document.querySelector(scopeSel);
+          if (slotScope && !slotScope.contains(wrap)) return;
+        }
+        if (!byAsin.has(asin)) byAsin.set(asin, wrap);
       });
       if (byAsin.size >= 2) break;
     }
@@ -643,19 +665,45 @@ function sleepPaced(ms, run) {
   function amazonPrice(node) {
     const priceStrategies = [
       {
-        name: 'standard-offscreen',
-        selectors: ['.a-price .a-offscreen', '.a-price[data-a-color="price"] .a-offscreen', '[data-a-color="price"] .a-offscreen']
+        name: 'offscreen-primary',
+        selectors: [
+          '.a-price .a-offscreen',
+          '.a-price[data-a-color="price"] .a-offscreen',
+          '.a-price[data-a-size="xl"] .a-offscreen',
+          '[data-cy="price-recipe"] .a-offscreen',
+          '.a-text-price .a-offscreen',
+          '[data-component-type="s-price"] .a-offscreen',
+          'span[class*="price"] .a-offscreen'
+        ]
       },
       {
         name: 'whole-fraction',
-        fn: (node) => {
-          const whole = node.querySelector('.a-price-whole');
+        fn: (n) => {
+          const whole = n.querySelector('.a-price-whole');
           if (!whole) return null;
           const w = parseInt(String(whole.textContent).replace(/[^\d]/g, ''), 10);
           const priceBlock = whole.closest('.a-price');
           const fracEl = priceBlock && priceBlock.querySelector('.a-price-fraction');
           const f = fracEl ? parseInt(String(fracEl.textContent).replace(/[^\d]/g, ''), 10) : 0;
-          return Number.isFinite(w) ? w + (Number.isFinite(f) ? f / 100 : 0) : null;
+          if (!Number.isFinite(w)) return null;
+          return w + (Number.isFinite(f) ? f / 100 : 0);
+        }
+      },
+      {
+        name: 'data-attribute',
+        fn: (n) => {
+          // Modern layouts cache the price in hydration data attributes.
+          const el = n.querySelector(
+            '[data-price], [data-a-price], [data-price-whole], [data-csa-c-price], [data-eq-price]'
+          );
+          if (!el) return null;
+          const raw = el.getAttribute('data-price') || el.getAttribute('data-a-price') ||
+                      el.getAttribute('data-price-whole') || el.getAttribute('data-csa-c-price') ||
+                      el.getAttribute('data-eq-price') || '';
+          const m = String(raw).replace(/,/g, '').match(/\d+(?:\.\d{1,2})?/);
+          if (!m) return null;
+          const v = parseFloat(m[0]);
+          return Number.isFinite(v) && v > 0 ? v : null;
         }
       },
       {
@@ -687,8 +735,8 @@ function sleepPaced(ms, run) {
       }
     }
 
-    // 5) Crude last resort: first "$amount" in visible text
-    const text = (node.innerText || node.textContent || '').slice(0, 500);
+    // Last resort: first "$amount" in visible text (strip commas, accept ranges).
+    const text = (node.innerText || node.textContent || '').slice(0, 800);
     const m = text.match(/\$\s?([\d,]+(?:\.\d+)?)/);
     if (m) { const v = parseFloat(m[1].replace(/,/g, '')); if (Number.isFinite(v) && v > 0) { log('Price found via text regex'); return v; } }
     warn('No price found in container');
@@ -701,13 +749,13 @@ function sleepPaced(ms, run) {
       const anchorSelectors = [
         'h2 a[href*="/dp/"]',
         'h2 a[href*="/gp/product/"]',
-        'h2 a[href*="/sspa/click/"]',
+        'h2 a[href*="/sspa/click"]',
         'h2 a.a-link-normal[href]',
         'a.a-link-normal.s-link-style[href*="/dp/"]',
         'a.a-link-normal.s-link-style[href*="/gp/product/"]',
         'a[href*="/dp/"][aria-label]',
         'a[href*="/gp/product/"][aria-label]',
-        'a[href*="/sspa/click/"]',
+        'a[href*="/sspa/click"]',
         'h2 a.a-link-normal',
         '.a-link-normal[href*="/dp/"]',
         '[data-cy="title-recipe"] a',
@@ -835,10 +883,34 @@ function sleepPaced(ms, run) {
     } catch (e) { warn('parseAmazonNode error:', e.message); return null; }
   }
 
-  function extractAmazon() {
+  /**
+   * Extract Amazon search results.
+   *
+   * Amazon renders the first viewport immediately on some 2024-2026 A/B
+   * layouts and lazy-hydrates the rest of the grid only after the tab
+   * finishes loading and the user scrolls. A single synchronous read was
+   * clutching only the ~6 visible cards — the main reason pages were
+   * reporting ~1-6 instead of 16-24. This version re-scans after a bounded
+   * scroll + wait so the full organic set is in the DOM before parsing.
+   */
+  async function extractAmazon(run) {
+    let containers = amazonContainers();
+    const minExpected = 8; // a fully-loaded page exposes 16-24 organic cards
+
+    for (let attempt = 0; attempt < 2 && containers.length < minExpected; attempt++) {
+      log(`Amazon grid still thin (${containers.length} < ${minExpected}); scrolling for lazy render...`);
+      window.scrollTo(0, document.body.scrollHeight);
+      await sleepPaced(800 + attempt * 500, run);
+      if (!isCurrent(run)) return [];
+      containers = amazonContainers();
+    }
+
+    // Return to the top so pagination starts from a clean scroll position.
+    window.scrollTo({ top: 0, behavior: 'instant' });
+
     const items = [];
     const seen = new Set();
-    for (const node of amazonContainers()) {
+    for (const node of containers) {
       const it = parseAmazonNode(node);
       if (!it || seen.has(it.id)) continue;
       seen.add(it.id);
@@ -1391,7 +1463,7 @@ function sleepPaced(ms, run) {
 
       let items = [];
       try {
-        items = SITE === 'amazon' ? extractAmazon() : extractEbay();
+        items = SITE === 'amazon' ? await extractAmazon(run) : extractEbay();
       } catch (e) {
         warn('Extraction error:', e.message);
         report(run, { error: 'parse-failed' });

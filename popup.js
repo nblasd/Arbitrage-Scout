@@ -22,6 +22,7 @@ const els = {
   q: $('q'),
   compare: $('btnCompare'),
   feeRate: $('feeRate'),
+  pageLimit: $('pageLimit'),
   progressBox: $('progressBox'),
   progressText: $('progressText'),
   chipAmazon: $('chipAmazon'),
@@ -42,6 +43,15 @@ const els = {
 
 const fmtUSD = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
 const fmtPct = (n) => `${n >= 0 ? '' : '−'}${Math.abs(n).toFixed(1)}%`;
+
+/** Validate the page-limit input: positive integer 1..20, default 3 when empty/invalid. */
+function getPageLimit() {
+  const raw = els.pageLimit.value.trim();
+  if (!raw) return 3;
+  const n = Math.floor(Number(raw));
+  if (!Number.isFinite(n) || n < 1) return 3;
+  return Math.min(n, 20);
+}
 
 /* ------------------------------------------------------------------ *
  * State
@@ -103,13 +113,14 @@ function render() {
     const amz = state.sites.amazon;
     const ebay = state.sites.ebay;
     const elapsed = Math.min(99, Math.floor((Date.now() - (state.startedAt || Date.now())) / 1000));
+    const pageLimit = Number.isInteger(state.pageLimit) && state.pageLimit > 0 ? state.pageLimit : 3;
     let step;
     if (ebay.status === 'loading') {
       const page = ebay.page || 1;
-      step = `Step 1 of 2 — searching eBay page ${page} of 3…`;
+      step = `Step 1 of 2 — searching eBay page ${page} of ${pageLimit}…`;
     } else if ((ebay.status === 'done' || ebay.status === 'error') && amz.status === 'loading') {
       const page = amz.page || 1;
-      step = `Step 2 of 2 — searching Amazon page ${page} of 3 & comparing…`;
+      step = `Step 2 of 2 — searching Amazon page ${page} of ${pageLimit} & comparing…`;
     } else {
       step = 'Comparing results…';
     }
@@ -272,12 +283,14 @@ function productCell(item, host, extra) {
   const wrap = makeEl('div', extra || 'prod');
   const img = item.image;
   if (img) {
+    const imWrap = makeEl('div', 'img-wrap');
     const im = document.createElement('img');
     im.src = img;
     im.alt = '';
     im.loading = 'lazy';
-    im.addEventListener('error', () => im.remove());
-    wrap.appendChild(im);
+    im.addEventListener('error', () => imWrap.remove());
+    imWrap.appendChild(im);
+    wrap.appendChild(imWrap);
   } else {
     wrap.appendChild(makeEl('span', 'ph', (item.title[0] || '?').toUpperCase()));
   }
@@ -416,11 +429,17 @@ async function startCompare() {
   }
   els.q.setCustomValidity('');
 
+  // Persist the page limit and validate it (positive integer, default 3).
+  const pageLimit = getPageLimit();
+  els.pageLimit.value = String(pageLimit);
+  chrome.storage.local.set({ pageLimit }).catch(() => {});
+
   // Optimistic local state so the UI responds instantly; the background's
   // authoritative ARB_STATE pushes will replace it as the run progresses.
   state = {
     runId: 'local',
     query,
+    pageLimit,
     phase: 'searching',
     startedAt: Date.now(),
     sites: {
@@ -435,7 +454,7 @@ async function startCompare() {
   startTicker(); // optimistic local state — keep the elapsed readout live
 
   try {
-    await chrome.runtime.sendMessage({ type: 'ARB_START', query });
+    await chrome.runtime.sendMessage({ type: 'ARB_START', query, pageLimit });
   } catch (e) {
     els.banner.innerHTML =
       '<span class="msg">Background worker is unavailable. Reload the extension on <b>chrome://extensions</b> and try again.</span>';
@@ -482,6 +501,7 @@ async function resetData() {
   // Clear input fields
   els.q.value = '';
   els.feeRate.value = '13'; // default fee rate
+  els.pageLimit.value = '3'; // default page limit
 
   // Reset chips to idle state
   els.chipEbay.classList.remove('busy', 'done', 'err');
@@ -537,6 +557,18 @@ function init() {
     if (res && res.feeRate != null) els.feeRate.value = res.feeRate;
   }).catch(() => {});
 
+  // Restore saved page limit.
+  chrome.storage.local.get('pageLimit').then((res) => {
+    if (res && res.pageLimit != null) {
+      const n = Math.floor(Number(res.pageLimit));
+      if (Number.isFinite(n) && n >= 1 && n <= 20) {
+        els.pageLimit.value = String(n);
+      } else {
+        els.pageLimit.value = '3';
+      }
+    }
+  }).catch(() => {});
+
   els.compare.addEventListener('click', startCompare);
   els.q.addEventListener('keydown', (e) => { if (e.key === 'Enter') startCompare(); });
 
@@ -548,6 +580,15 @@ function init() {
   els.feeRate.addEventListener('change', () => {
     chrome.storage.local.set({ feeRate: els.feeRate.value }).catch(() => {});
     renderResults();
+  });
+  els.pageLimit.addEventListener('change', () => {
+    const v = getPageLimit();
+    els.pageLimit.value = String(v);
+    chrome.storage.local.set({ pageLimit: v }).catch(() => {});
+  });
+  els.pageLimit.addEventListener('blur', () => {
+    const v = getPageLimit();
+    els.pageLimit.value = String(v);
   });
   els.hideNeg.addEventListener('change', renderResults);
 
