@@ -130,7 +130,9 @@ const ITEM_ALARM_WATCHDOG_MIN = 3;          // failsafe alarm, in minutes
 // MUST comfortably exceed a single page's yield (Amazon serves ~16-24 organic
 // cards/page) — at 16 it exactly equalled one page, so the cap branch settled
 // and closed the tab after page 1 every run (the "instant close" bug).
-const ANALYZE_MAX_AMAZON_ITEMS = 80;
+// Maximum Amazon items to collect before stopping (increased to support 10+ pages)
+// ~48 items per page * 15 pages = 720 items max
+const ANALYZE_MAX_AMAZON_ITEMS = 1000;
 // Amazon pages scraped per analyze run when the popup doesn't send a setting.
 const DEFAULT_ANALYZE_PAGES_PER_SITE = 5;
 // Maximum number of broader (fallback) Amazon queries tried after a 0-result
@@ -1257,6 +1259,9 @@ async function handleAnalyzeAmazonResults(msg, sender) {
     await settleAnalyzeAmazonStage('candidate cap reached');
     return;
   }
+
+  // Log current collection progress for debugging
+  console.log(`[ARBScout] Progress: ${(st.items || []).length}/${ANALYZE_MAX_AMAZON_ITEMS} items collected, continuing to page ${msgPage + 1}/${pagesPer}`);
 
   // Last requested page consumed — settle (pagination window over).
   const pagesPer = analyzeAmazonPagesPerSite();
