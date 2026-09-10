@@ -382,8 +382,9 @@ function sleepPaced(ms, run) {
 
     const present = () => {
       for (const sel of gridSelectors) {
-        if (document.querySelector(sel)) {
-          log('Grid detected via selector:', sel);
+        const el = document.querySelector(sel);
+        if (el) {
+          log('Grid detected via selector:', sel, '- element:', el.tagName);
           return true;
         }
       }
@@ -395,11 +396,19 @@ function sleepPaced(ms, run) {
         log('Grid detection: Found', productLinks.length, 'product links without standard containers');
         return true;
       }
+      log('Grid check: No selectors matched, productLinks count:', productLinks.length);
       return false;
     };
 
-    if (present()) return Promise.resolve(true);
-    if (isBlockedPage()) return Promise.resolve(false);
+    log('[GRID CHECK] Initial check at document.readyState:', document.readyState);
+    if (present()) {
+      log('[GRID CHECK] Grid already present on first check');
+      return Promise.resolve(true);
+    }
+    if (isBlockedPage()) {
+      log('[GRID CHECK] Blocked page detected, aborting grid wait');
+      return Promise.resolve(false);
+    }
 
     log('Waiting for Amazon grid to render...', { timeoutMs: CFG.gridWaitMs });
 
@@ -413,24 +422,40 @@ function sleepPaced(ms, run) {
         obs.disconnect();
         clearTimeout(giveUp);
         if (checkInterval) clearInterval(checkInterval);
+        log('[GRID WAIT] Finishing with result:', ok);
         resolve(ok);
       };
       const obs = new MutationObserver((mutations) => {
-        if (!isCurrent(run)) return finish(false);
+        if (!isCurrent(run)) {
+          log('[GRID WAIT] Mutation: run no longer current, aborting');
+          return finish(false);
+        }
         mutationCount += mutations.length;
         // Check every few mutations to reduce overhead
-        if (mutationCount % 2 === 0 && present()) finish(true);
+        if (mutationCount % 2 === 0 && present()) {
+          log('[GRID WAIT] Grid detected via mutation observer after', mutationCount, 'mutations');
+          finish(true);
+        }
       });
       obs.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+      log('[GRID WAIT] MutationObserver started, watching for DOM changes...');
       
       // Fallback: periodic check in case mutations don't trigger (e.g., JS replacing innerHTML)
       let fallbackChecks = 0;
       checkInterval = setInterval(() => {
-        if (!isCurrent(run)) return finish(false);
+        if (!isCurrent(run)) {
+          log('[GRID WAIT] Fallback check: run no longer current');
+          return finish(false);
+        }
         fallbackChecks++;
-        if (present()) finish(true);
+        log('[GRID WAIT] Fallback check #', fallbackChecks);
+        if (present()) {
+          log('[GRID WAIT] Grid detected via fallback check #', fallbackChecks);
+          finish(true);
+        }
         // Stop checking after 80% of timeout to avoid race with giveUp
         if (fallbackChecks >= Math.floor(CFG.gridWaitMs / 500) - 1) {
+          log('[GRID WAIT] Stopping fallback checks at', fallbackChecks);
           clearInterval(checkInterval);
         }
       }, 500);
@@ -438,8 +463,11 @@ function sleepPaced(ms, run) {
       const giveUp = setTimeout(() => {
         warn('Grid wait timeout - checking for partial render...');
         // Final check: even if timeout, if we found some elements, proceed
-        finish(present());
+        const finalCheck = present();
+        log('[GRID WAIT] Timeout reached - final check result:', finalCheck);
+        finish(finalCheck);
       }, CFG.gridWaitMs);
+      log('[GRID WAIT] Timeout set for', CFG.gridWaitMs, 'ms');
     });
   }
 
@@ -1789,13 +1817,19 @@ function sleepPaced(ms, run) {
     opts = opts || {};
     if (currentRun && isCurrent(currentRun)) killCurrent();
     const run = makeRun();
+    log('[SCRAPE START] runId:', run.id, 'hidden:', document.hidden, 'readyState:', document.readyState);
 
     const work = (async () => {
-      if (isBlockedPage()) { report(run, { error: 'blocked' }); return; }
+      if (isBlockedPage()) { 
+        log('[BLOCKED] Detected blocked page immediately');
+        report(run, { error: 'blocked' }); 
+        return; 
+      }
 
       // Phase 3: Amazon single-product pages (manual-match ASIN/URL override)
       // skip the search-grid machinery entirely — parse the buybox directly.
       if (SITE === 'amazon' && isProductPath) {
+        log('[PRODUCT PAGE] Parsing buybox instead of search grid');
         const item = parseAmazonProductPage();
         if (!isCurrent(run)) return;
         if (item) {
@@ -1808,19 +1842,34 @@ function sleepPaced(ms, run) {
       }
 
       if (!document.hidden) {
+        log('[PAUSE] Starting pre-parse human pause...');
         await humanPause(run, CFG.preParseMinMs, CFG.preParseMaxMs);
-        if (!isCurrent(run)) return;
+        log('[PAUSE] Pre-parse pause complete, checking run status...');
+        if (!isCurrent(run)) { log('[ABORT] Run superseded after pre-parse pause'); return; }
+        log('[SCROLL] Starting human scroll...');
         await humanScroll(run);
-        if (!isCurrent(run)) return;
+        log('[SCROLL] Scroll complete, checking run status...');
+        if (!isCurrent(run)) { log('[ABORT] Run superseded after scroll'); return; }
+        log('[PAUSE] Starting post-scroll pause...');
         await humanPause(run, 200, 400);
-        if (!isCurrent(run)) return;
+        log('[PAUSE] Post-scroll pause complete');
+        if (!isCurrent(run)) { log('[ABORT] Run superseded after post-scroll pause'); return; }
+      } else {
+        log('[SKIP] Document hidden, skipping human pacing');
       }
 
       if (SITE === 'amazon') {
+        log('[GRID WAIT] Starting waitAmazonGrid...');
         const gridReady = await waitAmazonGrid(run);
-        if (!isCurrent(run)) return;
-        if (isBlockedPage()) { report(run, { error: 'blocked' }); return; }
+        log('[GRID WAIT] Result:', gridReady, 'run still current:', isCurrent(run));
+        if (!isCurrent(run)) { log('[ABORT] Run superseded during grid wait'); return; }
+        if (isBlockedPage()) { 
+          log('[BLOCKED] Detected blocked page after grid wait');
+          report(run, { error: 'blocked' }); 
+          return; 
+        }
         if (!gridReady) {
+          log('[GRID FAIL] Grid did not render, checking for no-results message...');
           const noResultsEl = document.querySelector('.s-no-results, #noResultsTitle, .a-alert-heading, [data-component-type="s-no-results"]');
           if (noResultsEl && /no results|did not match|try checking|no products found/i.test(noResultsEl.textContent)) {
             report(run, { error: 'no-results' });
@@ -1829,6 +1878,7 @@ function sleepPaced(ms, run) {
           }
           return;
         }
+        log('[GRID OK] Grid ready, proceeding to extraction');
       }
       if (SITE === 'ebay') {
         const gridReady = await waitEbayGrid(run);
@@ -1860,21 +1910,27 @@ function sleepPaced(ms, run) {
       }
 
       if (!items.length) {
+        log('[NO ITEMS] Extraction returned empty array');
         if (SITE === 'amazon') {
           const hasProductLinks = document.querySelectorAll('a[href*="/dp/"], a[href*="/gp/product/"]').length > 0;
+          log('[NO ITEMS] Amazon - hasProductLinks:', hasProductLinks, 'priceStats:', priceStats);
           if (priceStats && priceStats.noPrice > 0 && hasProductLinks) {
             // Cards rendered with titles/links but no parsable price — a
             // DISTINCT, recoverable reason. background.js keeps the tab open
             // and retries / falls back instead of treating the stage as dead
             // and calling chrome.tabs.remove() on it.
+            log('[NO ITEMS] Reporting price-parse error');
             report(run, { error: 'price-parse', skippedForPrice: priceStats.noPrice });
           } else if (hasProductLinks) {
+            log('[NO ITEMS] Reporting parse-failed (has links but no items)');
             report(run, { error: 'parse-failed' });
           } else {
+            log('[NO ITEMS] Reporting no-results');
             report(run, { error: 'no-results' });
           }
         } else {
           const hasProductLinks = document.querySelectorAll('a[href*="/itm/"]').length > 0;
+          log('[NO ITEMS] eBay - hasProductLinks:', hasProductLinks);
           if (hasProductLinks) {
             report(run, { error: 'parse-failed' });
           } else {
@@ -1884,12 +1940,14 @@ function sleepPaced(ms, run) {
         return;
       }
 
+      log('[EXTRACTION OK] Items extracted:', items.length, '- proceeding to report');
       await humanPause(run, CFG.pauseMinMs, CFG.pauseMaxMs);
       if (SITE === 'ebay') {
         // Report how many pages eBay exposed so background.js can iterate all
         // of them dynamically (instead of stopping at a hardcoded page count).
         const maxPage = ebayMaxPage();
         log('eBay max page detected:', maxPage);
+        log('[REPORT] Sending eBay results:', items.length, 'items, maxPage:', maxPage);
         report(run, { items, maxPage });
       } else {
         // DEBUG: Detect and report Amazon's maxPage so background knows when to stop
@@ -1897,17 +1955,21 @@ function sleepPaced(ms, run) {
         log('[DEBUG] Amazon page', window.location.href);
         log('[DEBUG] Amazon items found:', items.length);
         log('[DEBUG] Amazon maxPage detected:', amazonMax);
+        log('[REPORT] Sending Amazon results:', items.length, 'items, maxPage:', amazonMax);
         report(run, { items, maxPage: amazonMax });
       }
     })();
 
     try {
+      log('[TIMEOUT WATCH] Starting scrape with deadline:', CFG.scrapeDeadlineMs, 'ms');
       await withTimeout(work, CFG.scrapeDeadlineMs, 'scrape');
+      log('[SCRAPE COMPLETE] Finished within deadline');
       if (isCurrent(run)) killCurrent();
     } catch (err) {
       const reason = err instanceof Error && /^timeout:/.test(err.message)
         ? 'timeout'
         : 'parse-failed';
+      log('[SCRAPE ERROR]', reason, '-', err.message);
       report(run, { error: reason });
       killCurrent();
     }
