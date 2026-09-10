@@ -927,8 +927,9 @@ async function navigateAnalyzeAmazonTab(query, page) {
   st.page = page;
   try { await registerScrapeTab(tab.id); await updateTabSweepAlarm(); } catch (_) { /* cleanup.js missing */ }
   setItemWatch('amazon');
+  const pagesPer = analyzeAmazonPagesPerSite();
   await commitAnalyze();
-  console.log(`[ARBScout] Amazon tab opened (page ${page}/${analyzeAmazonPagesPerSite()}):`, tab.id, { query: String(query).slice(0, 60) });
+  console.log(`[ARBScout] Amazon tab opened (page ${page}/${pagesPer}):`, tab.id, { query: String(query).slice(0, 60), pagesPer });
 }
 
 async function failAnalyzeStage(stage, reason) {
@@ -1135,6 +1136,7 @@ async function analyzeBuildQueryAndSearch() {
   st.items = [];
   st.priceParseRetried = false;
   st.pagesPerSite = analyzeAmazonPagesPerSite();
+  console.log(`[ARBScout] Amazon stage init: pagesPerSite=${st.pagesPerSite}, queries=${plan.length}`);
   analyzeCache.phase = 'searching-amazon';
   await commitAnalyze();
   console.log(`[ARBScout] Amazon query plan (${plan.length}):`, plan);
@@ -1258,6 +1260,7 @@ async function handleAnalyzeAmazonResults(msg, sender) {
 
   // Last requested page consumed — settle (pagination window over).
   const pagesPer = analyzeAmazonPagesPerSite();
+  console.log(`[ARBScout] Page check: msgPage=${msgPage}, pagesPer=${pagesPer}, condition=${msgPage >= pagesPer}`);
   if (msgPage >= pagesPer) {
     console.log(`[ARBScout] Amazon page ${msgPage}/${pagesPer} parsed — pagination complete`);
     await settleAnalyzeAmazonStage('pagination window complete');
@@ -1267,9 +1270,13 @@ async function handleAnalyzeAmazonResults(msg, sender) {
   // Keep the SAME tab open and crawl the next page with a human-like pause.
   const nextDelay = AMAZON_PAGE_DELAY_MIN_MS +
     Math.floor(Math.random() * (AMAZON_PAGE_DELAY_MAX_MS - AMAZON_PAGE_DELAY_MIN_MS + 1));
+  console.log(`[ARBScout] Waiting ${nextDelay}ms before next page (current: ${msgPage}, target: ${pagesPer})`);
   await new Promise((resolve) => setTimeout(resolve, nextDelay));
   if (!analyzeCache || analyzeCache.phase !== 'searching-amazon' ||
-      analyzeCache.stages.amazon.status !== 'loading') return;
+      analyzeCache.stages.amazon.status !== 'loading') {
+    console.log(`[ARBScout] Aborting pagination: cache=${!!analyzeCache}, phase=${analyzeCache?.phase}, status=${analyzeCache?.stages?.amazon?.status}`);
+    return;
+  }
   console.log(`[ARBScout] Crawling Amazon page ${msgPage + 1}/${pagesPer} of query "${String(activeQuery).slice(0, 40)}"`);
   await navigateAnalyzeAmazonTab(activeQuery, msgPage + 1);
 }
@@ -1409,7 +1416,9 @@ function analyzeAmazonPagesPerSite() {
   const raw = s && s.amazonPages != null ? s.amazonPages : s && s.pagesPerSite;
   let n = Math.floor(Number(raw));
   if (!Number.isInteger(n) || n < 1) n = DEFAULT_ANALYZE_PAGES_PER_SITE;
-  return Math.min(AMAZON_ABSOLUTE_MAX_PAGES, n);
+  const result = Math.min(AMAZON_ABSOLUTE_MAX_PAGES, n);
+  console.log(`[ARBScout] analyzeAmazonPagesPerSite: raw=${raw}, parsed=${n}, final=${result} (user wanted ${s?.amazonPages ?? 'unset'})`);
+  return result;
 }
 
 /** Merge incoming page items into the running list, de-duplicating by ASIN. */
