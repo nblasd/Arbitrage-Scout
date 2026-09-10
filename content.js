@@ -1631,6 +1631,99 @@ function sleepPaced(ms, run) {
     }
   }
 
+  /**
+   * Detect the total number of available pages from Amazon's pagination controls.
+   *
+   * Strategy:
+   *   1. Look for Amazon's pagination container with class "s-pagination-container"
+   *   2. Extract page numbers from pagination links (a[href*="page="])
+   *   3. Check for "Next" or "Siguiente" button to determine if more pages exist
+   *   4. Fall back to URL parameters and page count displays
+   *
+   * Returns null when pagination element is missing or malformed.
+   */
+  function amazonMaxPage() {
+    try {
+      const numbers = new Set();
+      let sawNext = false;
+
+      // 1) Primary: Amazon's pagination container
+      const paginationContainer = document.querySelector('.s-pagination-container');
+      if (paginationContainer) {
+        // Get all page number links
+        const pageLinks = paginationContainer.querySelectorAll('a[href*="page="], a[href*="ref=sr_pg_"]');
+        for (const link of pageLinks) {
+          const text = (link.textContent || '').replace(/\s+/g, ' ').trim();
+          const asNum = parseInt(text, 10);
+          if (Number.isInteger(asNum) && asNum > 0 && asNum <= 500) {
+            numbers.add(asNum);
+          }
+          // Check for next button
+          if (/next|siguiente|suivant|weiter|prossimo|avançar/i.test(text) || 
+              /next|siguiente|suivant|weiter|prossimo|avançar/i.test(link.getAttribute('aria-label') || '')) {
+            sawNext = true;
+          }
+        }
+
+        // Also check for span/page elements with numbers
+        const pageElements = paginationContainer.querySelectorAll('span, div, li');
+        for (const el of pageElements) {
+          const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+          const asNum = parseInt(text, 10);
+          if (Number.isInteger(asNum) && asNum > 0 && asNum <= 500) {
+            numbers.add(asNum);
+          }
+        }
+      }
+
+      // 2) Fallback: scan all links with page parameter
+      if (numbers.size === 0) {
+        const links = document.querySelectorAll('a[href*="page="]');
+        for (const link of links) {
+          const href = link.getAttribute('href') || '';
+          const match = href.match(/[?&]page=(\d+)/);
+          if (match) {
+            const asNum = parseInt(match[1], 10);
+            if (Number.isInteger(asNum) && asNum > 0 && asNum <= 500) {
+              numbers.add(asNum);
+            }
+          }
+        }
+      }
+
+      // 3) Check for "Next" button separately
+      if (!sawNext) {
+        const nextButton = document.querySelector(
+          '.s-pagination-next, a[href*="page="][aria-label*="next" i], a[href*="page="][aria-label*="siguiente" i], button[class*="next"], [role="button"][aria-label*="next" i]'
+        );
+        if (nextButton) sawNext = true;
+      }
+
+      if (numbers.size) {
+        const max = Math.max(...numbers);
+        // If there's a next button, there might be one more page
+        return sawNext ? Math.max(max, max + 1) : max;
+      }
+
+      // 4) Last resort: check current page URL and estimate from result count
+      const currentPageMatch = location.search.match(/[?&]page=(\d+)/);
+      if (currentPageMatch) {
+        const currentPage = parseInt(currentPageMatch[1], 10);
+        // If we're on a page and there are results, assume at least this many pages exist
+        const resultItems = document.querySelectorAll('[data-asin]');
+        if (resultItems.length > 0) {
+          return currentPage;
+        }
+      }
+
+      log('Amazon pagination element not found - maxPage unknown');
+      return null;
+    } catch (e) {
+      warn('amazonMaxPage error:', e.message);
+      return null;
+    }
+  }
+
   function extractEbay() {
     const items = [];
     const seen = new Set();
