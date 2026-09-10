@@ -38,11 +38,67 @@ const els = {
   openAmazon: $('btnOpenAmazon'),
   openEbay: $('btnOpenEbay'),
   reset: $('btnReset'),
-  toast: $('toast')
+  debugLog: $('btnDebugLog'),
+  toast: $('toast'),
+
+  // Phase 2: analyze flow
+  ebayUrl: $('ebayUrl'),
+  analyzeBtn: $('btnAnalyze'),
+  quickSettingsBtn: $('btnQuickSettings'),
+  quickSettings: $('quickSettings'),
+  anEbayFeeRate: $('anEbayFeeRate'),
+  anFixedFee: $('anFixedFee'),
+  anSalesTax: $('anSalesTax'),
+  anBuffer: $('anBuffer'),
+  amazonPages: $('amazonPages'),
+  analyzeProgress: $('analyzeProgress'),
+  analyzeStep: $('analyzeStep'),
+  analyzeElapsed: $('analyzeElapsed'),
+  chipStepEbay: $('chipStepEbay'),
+  chipStepAmazon: $('chipStepAmazon'),
+  chipStepProfit: $('chipStepProfit'),
+  analyzeRetry: $('btnAnalyzeRetry'),
+  analyzeCancel: $('btnAnalyzeCancel'),
+  analyzeError: $('analyzeError'),
+  analyzeResult: $('analyzeResult'),
+  anEbayThumb: $('anEbayThumb'),
+  anEbayTitle: $('anEbayTitle'),
+  anEbayPrice: $('anEbayPrice'),
+  anEbayShip: $('anEbayShip'),
+  anEbayLink: $('anEbayLink'),
+  anAmazonThumb: $('anAmazonThumb'),
+  anAmazonTitle: $('anAmazonTitle'),
+  anAmazonPrice: $('anAmazonPrice'),
+  anMatches: $('anMatches'),
+  anAmazonPrime: $('anAmazonPrime'),
+  anAmazonLink: $('anAmazonLink'),
+  anConfidence: $('anConfidence'),
+  anStrategy: $('anStrategy'),
+  anProfitBox: $('anProfitBox'),
+  anNetProfit: $('anNetProfit'),
+  anRoi: $('anRoi'),
+  anMargin: $('anMargin'),
+  anBreakdown: $('anBreakdown'),
+  anProfitWarn: $('anProfitWarn'),
+
+  // Phase 3: safety harness, blocked recovery, manual match, export
+  anSafetyBox: $('anSafetyBox'),
+  anManualMatch: $('anManualMatch'),
+  anAsinInput: $('anAsinInput'),
+  applyAsin: $('btnApplyAsin'),
+  copyBreakdown: $('btnCopyBreakdown'),
+  exportCsv: $('btnExportCsv'),
+  anExportHint: $('anExportHint'),
+  blockedRecovery: $('blockedRecovery'),
+  blockedRecoveryMsg: $('blockedRecoveryMsg'),
+  focusBlockedTab: $('btnFocusBlockedTab'),
+  blockedRetry: $('btnBlockedRetry')
 };
 
 const fmtUSD = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
 const fmtPct = (n) => `${n >= 0 ? '' : '−'}${Math.abs(n).toFixed(1)}%`;
+
+const CONFIDENCE_MANUAL_THRESHOLD = 75; // below this: show manual-override UI
 
 /** Validate the page-limit input: positive integer 1..20, default 3 when empty/invalid. */
 function getPageLimit() {
@@ -548,6 +604,599 @@ function rerenderFromConfig() {
   renderResults();
 }
 
+/* ==================================================================== *
+ * Phase 2: eBay-URL → Amazon analyze flow (UI controller)             *
+ * ====================================================================
+ * State comes from the background via ARB_ANALYZE_STATE pushes; the popup
+ * never computes the match itself. Profit math is available locally via
+ * profit.js (self.ARBProfit) so settings changes re-render instantly
+ * without re-scraping — same pattern as the fee % in the compare table.
+ */
+let analyzeState = null;
+let analyzeTicker = null;
+
+const ANALYZE_STEP_TEXT = {
+  'fetching-ebay': 'Fetching eBay listing…',
+  'searching-amazon': 'Matching on Amazon…',
+  'calculating': 'Calculating profit…'
+};
+const ANALYZE_ERROR_LABELS = {
+  blocked: 'bot check / CAPTCHA',
+  timeout: 'timed out',
+  'no-title': 'no readable title',
+  'parse-failed': 'could not parse the page',
+  closed: 'tab was closed',
+  'no-results': 'no results found',
+  'no-results-page': 'redirected to a non-search page',
+  'no-query': 'page had no search query',
+  'chrome-error': 'page failed to load (network error)'
+};
+const ANALYZE_ACTIVE_PHASES = ['fetching-ebay', 'searching-amazon', 'calculating'];
+
+function stopAnalyzeTicker() {
+  if (analyzeTicker) { clearInterval(analyzeTicker); analyzeTicker = null; }
+}
+
+function startAnalyzeTicker() {
+  if (analyzeTicker) return;
+  analyzeTicker = setInterval(() => {
+    if (!(analyzeState && ANALYZE_ACTIVE_PHASES.includes(analyzeState.phase))) {
+      stopAnalyzeTicker();
+      return;
+    }
+    const s = Math.floor((Date.now() - (analyzeState.startedAt || Date.now())) / 1000);
+    els.analyzeElapsed.textContent = `${s}s`;
+  }, 1000);
+}
+
+/** Read + clamp the four quick-settings inputs into a settings object. */
+function readAnalyzeSettings() {
+  const num = (el, min, max, dflt) => {
+    const v = parseFloat(el.value);
+    if (!Number.isFinite(v)) return dflt;
+    return Math.max(min, Math.min(max, v));
+  };
+  return {
+    ebayFeeRate: num(els.anEbayFeeRate, 0, 40, 13.25),
+    fixedFee: num(els.anFixedFee, 0, 5, 0.30),
+    estimatedSalesTax: num(els.anSalesTax, 0, 15, 7),
+    extraCostBuffer: num(els.anBuffer, 0, 50, 0),
+    amazonPages: num(els.amazonPages, 1, 20, 3)
+  };
+}
+
+function saveAnalyzeSettings(settings) {
+  chrome.storage.local.set({ arbSettings: settings }).catch(() => {});
+}
+
+function applyAnalyzeSettings(settings) {
+  if (!settings) return;
+  if (settings.ebayFeeRate != null) els.anEbayFeeRate.value = settings.ebayFeeRate;
+  if (settings.fixedFee != null) els.anFixedFee.value = settings.fixedFee;
+  if (settings.estimatedSalesTax != null) els.anSalesTax.value = settings.estimatedSalesTax;
+  if (settings.extraCostBuffer != null) els.anBuffer.value = settings.extraCostBuffer;
+  if (settings.amazonPages != null) els.amazonPages.value = settings.amazonPages;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+function confidenceInfo(c) {
+  if (c == null) return { label: 'No match', cls: 'none' };
+  const pct = Math.round(c * 100);
+  if (pct >= 90) return { label: `${pct}% Match — High Confidence`, cls: 'high' };
+  if (pct >= 75) return { label: `${pct}% Match — Possible Match`, cls: 'mid' };
+  return { label: `${pct}% Match — Low Confidence`, cls: 'low' };
+}
+
+function setThumb(wrap, src, letter) {
+  wrap.replaceChildren();
+  if (src && /^https:\/\//.test(src)) {
+    const img = document.createElement('img');
+    img.src = src;
+    img.alt = '';
+    img.loading = 'lazy';
+    img.addEventListener('error', () => {
+      wrap.replaceChildren(makeEl('span', 'ph', letter));
+    });
+    wrap.appendChild(img);
+  } else {
+    wrap.appendChild(makeEl('span', 'ph', letter));
+  }
+}
+
+function renderAnalyzeChip(chipEl, name, stageStatus, stageError, hint) {
+  const lbl = chipEl.querySelector('.lbl');
+  chipEl.classList.toggle('busy', stageStatus === 'loading');
+  chipEl.classList.toggle('done', stageStatus === 'done');
+  chipEl.classList.toggle('err', stageStatus === 'error');
+  if (stageStatus === 'loading') lbl.textContent = hint ? `${name}: loading… ${hint}` : `${name}: loading…`;
+  else if (stageStatus === 'done') lbl.textContent = `${name}: done`;
+  else if (stageStatus === 'error') lbl.textContent = `${name}: ${ANALYZE_ERROR_LABELS[stageError] || stageError}`;
+  else lbl.textContent = `${name}: waiting`;
+}
+
+function renderAnalyze() {
+  const st = analyzeState;
+  const active = !!(st && ANALYZE_ACTIVE_PHASES.includes(st.phase));
+
+  els.analyzeProgress.classList.toggle('hidden', !active);
+  els.analyzeError.classList.toggle('hidden', !(st && st.phase === 'error'));
+  els.analyzeResult.classList.toggle('hidden', !(st && st.phase === 'done' && st.match));
+  els.analyzeBtn.disabled = active;
+  els.ebayUrl.disabled = active;
+  els.analyzeCancel.classList.toggle('hidden', !active);
+  // "Analyze again" appears on failure — it re-runs the whole flow with the
+  // same URL (the stage-level retry path stays available to power users via
+  // ARB_ANALYZE_RETRY, but a full re-run is the safer default after CAPTCHAs).
+  els.analyzeRetry.classList.toggle('hidden', !(st && st.phase === 'error'));
+
+  if (!st) { stopAnalyzeTicker(); return; }
+
+  if (active) {
+    els.analyzeStep.textContent = ANALYZE_STEP_TEXT[st.phase] || 'Working…';
+    startAnalyzeTicker();
+  } else {
+    stopAnalyzeTicker();
+  }
+
+  renderAnalyzeChip(els.chipStepEbay, 'eBay', st.stages.ebay.status, st.stages.ebay.error);
+  const amz = st.stages.amazon;
+  const amzHint = (amz.status === 'loading' && amz.pagesDone > 0 && Number.isInteger(amz.pagesPerSite))
+    ? `page ${amz.pagesDone}/${amz.pagesPerSite}` : null;
+  renderAnalyzeChip(els.chipStepAmazon, 'Amazon', amz.status, amz.error, amzHint);
+  const profitStatus = st.phase === 'calculating' ? 'loading'
+    : st.phase === 'done' && st.profit ? 'done' : 'idle';
+  renderAnalyzeChip(els.chipStepProfit, 'Profit', profitStatus, null);
+  if (st.phase === 'done' && !st.profit) {
+    els.chipStepProfit.querySelector('.lbl').textContent = 'Profit: no match';
+  }
+
+  if (st.phase === 'error') {
+    const um = (st.error && (st.error.userMessage || st.error.message)) || 'Something went wrong.';
+    els.analyzeError.innerHTML = `<span class="msg">${escapeHtml(um)} Click <b>Analyze Product</b> to try again.</span>`;
+  } else {
+    els.analyzeError.innerHTML = '';
+  }
+
+  // Phase 3: blocked-stage recovery banner. failAnalyzeStage deliberately
+  // keeps the blocked stage's tab OPEN — that tab is the CAPTCHA surface.
+  const blockedStage = ['ebay', 'amazon'].find((s) =>
+    st.stages[s].status === 'error' && st.stages[s].error === 'blocked');
+  if (st.phase === 'error' && blockedStage) {
+    const name = blockedStage === 'amazon' ? 'Amazon' : 'eBay';
+    els.blockedRecoveryMsg.innerHTML =
+      `<b>${name} requires verification.</b> Please complete the CAPTCHA in the opened tab, then click <b>Retry</b>.`;
+    els.blockedRecovery.classList.remove('hidden');
+  } else {
+    els.blockedRecovery.classList.add('hidden');
+  }
+
+  if (st.phase === 'done' && st.match) renderAnalyzeResult();
+}
+
+function renderAnalyzeResult() {
+  const st = analyzeState;
+  const ep = st.ebayProduct || {};
+  const best = (st.match && st.match.bestMatch) || null;
+
+  /* ---- eBay side ---- */
+  setThumb(els.anEbayThumb, ep.image, 'e');
+  els.anEbayTitle.textContent = ep.title || '—';
+  els.anEbayTitle.title = ep.title || '';
+  els.anEbayPrice.textContent = ep.price != null ? ARBProfit.fmtUSD(ep.price) : '—';
+  els.anEbayShip.textContent = ep.shippingLabel
+    ? ` · ${ep.shippingLabel}`
+    : (ep.shipping > 0 ? ` + ${ARBProfit.fmtUSD(ep.shipping)} ship` : '');
+  const ebayHref = safeUrl(ep.url, 'ebay');
+  els.anEbayLink.href = ebayHref || '#';
+  els.anEbayLink.style.visibility = ebayHref ? 'visible' : 'hidden';
+
+  /* ---- Amazon side ---- */
+  if (best) {
+    setThumb(els.anAmazonThumb, best.image, 'a');
+    els.anAmazonTitle.textContent = best.title;
+    els.anAmazonTitle.title = best.title;
+    els.anAmazonPrice.textContent = best.price != null ? ARBProfit.fmtUSD(best.price) : '—';
+    els.anAmazonPrime.classList.toggle('hidden', !best.isPrime);
+    const amzHref = safeUrl(best.url, 'amazon');
+    els.anAmazonLink.href = amzHref || '#';
+    els.anAmazonLink.style.visibility = amzHref ? 'visible' : 'hidden';
+  } else {
+    setThumb(els.anAmazonThumb, null, 'a');
+    els.anAmazonTitle.textContent = 'No confident match found';
+    els.anAmazonTitle.title = '';
+    els.anAmazonPrice.textContent = '—';
+    els.anAmazonPrime.classList.add('hidden');
+    els.anAmazonLink.style.visibility = 'hidden';
+  }
+
+  /* ---- Confidence badge ---- */
+  const info = confidenceInfo(st.match.matched ? st.match.confidence : null);
+  els.anConfidence.textContent = info.label;
+  els.anConfidence.className = `conf ${info.cls}`;
+  // On a no-match outcome the matcher's own warnings carry the actionable
+  // detail ("Best candidate scored 43% (below the 60% threshold).") — show
+  // them where the strategy label normally sits instead of hiding them.
+  const matchWarns = (!st.match.matched && Array.isArray(st.match.warnings))
+    ? st.match.warnings : [];
+  els.anStrategy.textContent = matchWarns.length
+    ? matchWarns.join(' ')
+    : (st.match.strategy ? `via ${st.match.strategy}` : '');
+
+  /* ---- All other candidates >= the 50% floor ---- */
+  renderMatchesList(st, best);
+
+  /* ---- Profit box (recomputed locally so settings edits are instant) ---- */
+  let p = st.profit;
+  if (ep && best) {
+    // Recompute locally so quick-settings edits re-render instantly; the
+    // inputs always carry values (HTML defaults + storage restore), so the
+    // run's stored settings are only a fallback for a fresh profile.
+    p = ARBProfit.calculateArbitrageProfit(
+      { price: ep.price, shipping: ep.shipping },
+      { price: best.price, shipping: best.shipping || 0, isPrime: !!best.isPrime },
+      readAnalyzeSettings()
+    );
+  }
+  if (p) {
+    els.anNetProfit.textContent = ARBProfit.fmtUSD(p.netProfit);
+    els.anNetProfit.className = 'p-value ' + (p.netProfit >= 0 ? 'pos' : 'neg');
+    els.anRoi.textContent = p.roi != null ? fmtPct(p.roi) : '—';
+    els.anRoi.className = 'p-value ' + ((p.roi || 0) >= 0 ? 'pos' : 'neg');
+    els.anMargin.textContent = p.margin != null ? fmtPct(p.margin) : '—';
+    els.anMargin.className = 'p-value ' + ((p.margin || 0) >= 0 ? 'pos' : 'neg');
+    els.anBreakdown.innerHTML = p.breakdownLines.map(escapeHtml).join('<br/>');
+    const warns = p.warnings || [];
+    els.anProfitWarn.classList.toggle('hidden', !warns.length);
+    els.anProfitWarn.textContent = warns.join(' ');
+    els.anProfitBox.classList.remove('hidden');
+  } else {
+    els.anProfitBox.classList.add('hidden');
+  }
+
+  renderSafetyBox(st);
+  renderManualMatch(st);
+}
+
+/**
+ * Render every candidate that scored >= the 50% acceptance floor (the
+ * matcher's `matches` list), minus the primary pick already shown in the
+ * Amazon card. Rows link straight to the Amazon listing. Styling is inline
+ * so the list needs no popup.css changes.
+ */
+function renderMatchesList(st, best) {
+  const box = els.anMatches;
+  if (!box) return;
+  box.replaceChildren();
+  const all = (st.match && Array.isArray(st.match.matches)) ? st.match.matches : [];
+  const others = all.filter((m) => !best || !m.asin || m.asin !== best.asin);
+  if (!others.length) { box.classList.add('hidden'); return; }
+
+  const head = makeEl('div', '');
+  head.textContent = `Other matches ≥ 50% (${others.length})`;
+  head.style.cssText = 'font-size:11px;opacity:.7;margin:6px 2px 2px;text-transform:uppercase;letter-spacing:.04em;';
+  box.appendChild(head);
+
+  for (const m of others.slice(0, 9)) {
+    const row = document.createElement('a');
+    row.className = 'match-row';
+    const href = safeUrl(m.url, 'amazon');
+    row.href = href || '#';
+    row.target = '_blank';
+    row.rel = 'noopener';
+    row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:4px 2px;border-top:1px solid rgba(128,128,128,.2);text-decoration:none;color:inherit;';
+
+    const thumb = makeEl('span', '');
+    thumb.style.cssText = 'flex:0 0 28px;height:28px;border-radius:4px;background:rgba(128,128,128,.15);display:flex;align-items:center;justify-content:center;font-size:12px;overflow:hidden;';
+    if (m.image && /^https:\/\//.test(m.image)) {
+      const img = document.createElement('img');
+      img.src = m.image;
+      img.alt = '';
+      img.loading = 'lazy';
+      img.style.cssText = 'width:100%;height:100%;object-fit:contain;';
+      img.addEventListener('error', () => { thumb.textContent = 'a'; });
+      thumb.appendChild(img);
+    } else {
+      thumb.textContent = 'a';
+    }
+
+    const mid = makeEl('span', '');
+    mid.style.cssText = 'flex:1 1 auto;min-width:0;';
+    const title = makeEl('div', '');
+    title.textContent = m.title || m.asin || 'Amazon listing';
+    title.title = title.textContent;
+    title.style.cssText = 'font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+    const price = makeEl('div', '');
+    price.textContent = m.price != null ? ARBProfit.fmtUSD(m.price) : '—';
+    price.style.cssText = 'font-size:11px;opacity:.8;';
+    mid.append(title, price);
+
+    const conf = makeEl('span', '');
+    conf.textContent = `${Math.round((m.score || 0) * 100)}%`;
+    conf.style.cssText = `flex:0 0 auto;font-size:11px;font-weight:600;color:${(m.score || 0) >= 0.75 ? '#1a7f37' : (m.score || 0) >= 0.6 ? '#9a6700' : '#8a8a8a'};`;
+
+    row.append(thumb, mid, conf);
+    box.appendChild(row);
+  }
+  box.classList.remove('hidden');
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 3: safety harness (variation + quantity alerts)               *
+ * ------------------------------------------------------------------ */
+
+/**
+ * Paint the safety box from the background's assessSafety() result. When the
+ * background module is unavailable (defensive), fall back to a local pass so
+ * the user still gets the warnings.
+ */
+function renderSafetyBox(st) {
+  const box = els.anSafetyBox;
+  if (!box) return;
+  box.replaceChildren();
+
+  let safety = st.safety || null;
+  const ep = st.ebayProduct || {};
+  const best = (st.match && st.match.bestMatch) || null;
+  if (!safety && best && self.ARBSafety) {
+    try { safety = self.ARBSafety.assessSafety(ep, best); } catch (_) { safety = null; }
+  }
+  if (!safety) return;
+
+  if (!safety.alerts.length) {
+    // Quiet green confirmation only when there was something worth checking.
+    const hadVariation = safety.variation && safety.variation.hasVariation;
+    if (hadVariation || safety.quantity && safety.quantity.level === 'ok' && (safety.quantity.ebayQuantity > 1 || safety.quantity.amazonQuantity > 1)) {
+      box.appendChild(makeEl('div', 'safe-ok', '✓ Variation & quantity verified against the Amazon listing'));
+    }
+    return;
+  }
+
+  for (const alert of safety.alerts) {
+    const div = document.createElement('div');
+    div.className = `safety-alert ${alert.level}`;
+    const icon = document.createElement('span');
+    icon.className = 'icon';
+    icon.textContent = alert.level === 'hard' ? '⛔' : '⚠️';
+    const txt = document.createElement('span');
+    txt.textContent = alert.message;
+    div.appendChild(icon);
+    div.appendChild(txt);
+    box.appendChild(div);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 3: manual match correction (low-confidence fallback)          *
+ * ------------------------------------------------------------------ */
+
+function renderManualMatch(st) {
+  const wrap = els.anManualMatch;
+  if (!wrap) return;
+  const conf = st.match && st.match.matched ? st.match.confidence : null;
+  const show = st.match && (!st.match.matched ||
+    (conf != null && Math.round(conf * 100) < CONFIDENCE_MANUAL_THRESHOLD));
+  wrap.classList.toggle('hidden', !show);
+  if (show) {
+    els.anAsinInput.placeholder = st.manualMatch && st.manualMatch.asin
+      ? `Currently overridden: ${st.manualMatch.asin} — paste another ASIN or /dp/ URL…`
+      : 'Paste the verified Amazon ASIN or product URL…';
+  }
+}
+
+async function applyManualMatch() {
+  const input = els.anAsinInput.value.trim();
+  if (!input) { els.anAsinInput.focus(); return; }
+  // Client-side validation gives instant feedback; the background re-validates.
+  try {
+    self.ARBScout.validateAmazonAsin(input);
+  } catch (err) {
+    els.anExportHint.textContent = err.userMessage || 'That is not a valid Amazon ASIN or product URL.';
+    els.anAsinInput.focus();
+    return;
+  }
+  els.anExportHint.textContent = '';
+  els.applyAsin.disabled = true;
+  // Optimistic UI: show the Amazon stage as loading until the next push.
+  if (analyzeState) {
+    analyzeState.phase = 'searching-amazon';
+    analyzeState.manualMatch = { asin: input, url: null, appliedAt: Date.now() };
+    if (analyzeState.stages) {
+      analyzeState.stages.amazon.status = 'loading';
+      analyzeState.stages.amazon.error = null;
+    }
+    renderAnalyze();
+  }
+  try {
+    await chrome.runtime.sendMessage({ type: 'ARB_ANALYZE_MANUAL_MATCH', input });
+  } catch (_) {
+    els.anExportHint.textContent = 'Background worker unavailable — reload the extension and try again.';
+  } finally {
+    els.applyAsin.disabled = false;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 3: export — Copy Breakdown / Export CSV                       *
+ * ------------------------------------------------------------------ */
+
+/** Assemble the current analyze result into the export.js shape. */
+function currentAnalyzeResult() {
+  const st = analyzeState;
+  if (!st || st.phase !== 'done') return null;
+  const ep = st.ebayProduct || {};
+  const best = (st.match && st.match.bestMatch) || null;
+  if (!best) return null;
+
+  // Recompute profit with the LIVE settings (same as the rendered card).
+  const profit = ARBProfit.calculateArbitrageProfit(
+    { price: ep.price, shipping: ep.shipping },
+    { price: best.price, shipping: best.shipping || 0, isPrime: !!best.isPrime },
+    readAnalyzeSettings()
+  );
+
+  let safety = st.safety || null;
+  if (!safety && self.ARBSafety) {
+    try { safety = self.ARBSafety.assessSafety(ep, best); } catch (_) { safety = null; }
+  }
+
+  return {
+    ebayProduct: ep,
+    amazonMatch: {
+      title: best.title,
+      price: best.price,
+      shipping: best.shipping || 0,
+      isPrime: !!best.isPrime,
+      asin: best.asin || null,
+      url: best.url || null,
+      confidence: st.match.matched ? st.match.confidence : null
+    },
+    profit,
+    safety
+  };
+}
+
+async function copyBreakdown() {
+  const result = currentAnalyzeResult();
+  if (!result) {
+    els.anExportHint.textContent = 'Nothing to copy — run an analyze first.';
+    return;
+  }
+  const text = self.ARBExport.buildBreakdownText(result);
+  try {
+    await navigator.clipboard.writeText(text);
+    els.anExportHint.textContent = 'Breakdown copied to clipboard ✓';
+  } catch (_) {
+    // Clipboard API can be denied in some popup contexts — fall back to a
+    // hidden textarea + execCommand (deprecated but universally available).
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+      els.anExportHint.textContent = 'Breakdown copied to clipboard ✓';
+    } catch (_) {
+      els.anExportHint.textContent = 'Copy failed — your browser blocked clipboard access.';
+    }
+  }
+  setTimeout(() => { els.anExportHint.textContent = ''; }, 4000);
+}
+
+function downloadCsv(content, filename) {
+  const blob = new Blob([content], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+function exportCsv() {
+  const result = currentAnalyzeResult();
+  if (!result) {
+    els.anExportHint.textContent = 'Nothing to export — run an analyze first.';
+    setTimeout(() => { els.anExportHint.textContent = ''; }, 4000);
+    return;
+  }
+  const csv = self.ARBExport.buildCsv([result]);
+  const stamp = new Date().toISOString().slice(0, 10);
+  downloadCsv(csv, `arbitrage-lead-${stamp}.csv`);
+  els.anExportHint.textContent = 'CSV exported ✓';
+  setTimeout(() => { els.anExportHint.textContent = ''; }, 4000);
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 3: blocked-stage recovery actions                             *
+ * ------------------------------------------------------------------ */
+
+function blockedAnalyzeStage() {
+  const st = analyzeState;
+  if (!st) return null;
+  return ['ebay', 'amazon'].find((s) =>
+    st.stages && st.stages[s] && st.stages[s].status === 'error' && st.stages[s].error === 'blocked') || null;
+}
+
+async function focusBlockedTab() {
+  const stage = blockedAnalyzeStage();
+  if (!stage) return;
+  try { await chrome.runtime.sendMessage({ type: 'ARB_ANALYZE_FOCUS_TAB', stage }); } catch (_) { /* ignore */ }
+}
+
+async function blockedRetry() {
+  // Stage-level retry re-uses the (solved) tab session — the best recovery
+  // path after a CAPTCHA. Falls back to a full re-run when no URL is known.
+  try { await chrome.runtime.sendMessage({ type: 'ARB_ANALYZE_RETRY' }); }
+  catch (_) { if (els.ebayUrl.value.trim()) await startAnalyze(); }
+}
+
+async function applyAnalyzeState(st) {
+  // Coherence guard (mirrors applyState): an in-flight phase must have a
+  // loading stage; anything else is a phantom and drops back to idle.
+  const loading = st && ANALYZE_ACTIVE_PHASES.includes(st.phase);
+  if (loading && !(st.stages && (st.stages.ebay.status === 'loading' || st.stages.amazon.status === 'loading'))) {
+    analyzeState = null;
+    renderAnalyze();
+    return;
+  }
+  analyzeState = st;
+  renderAnalyze();
+}
+
+async function startAnalyze() {
+  const raw = els.ebayUrl.value.trim();
+  if (!raw) { els.ebayUrl.focus(); return; }
+  const settings = readAnalyzeSettings();
+  saveAnalyzeSettings(settings);
+
+  // Optimistic local state; authoritative pushes replace it.
+  analyzeState = {
+    runId: 'local', url: raw, phase: 'fetching-ebay', startedAt: Date.now(),
+    settings,
+    stages: {
+      ebay: { status: 'loading', error: null, tabId: null },
+      amazon: { status: 'idle', error: null, tabId: null }
+    },
+    ebayProduct: null, queryInfo: null, amazonResults: [], match: null, profit: null, error: null,
+    manualMatch: null, safety: null
+  };
+  els.analyzeError.classList.add('hidden');
+  renderAnalyze();
+
+  try {
+    await chrome.runtime.sendMessage({ type: 'ARB_ANALYZE', url: raw, settings });
+  } catch (e) {
+    analyzeState = null;
+    renderAnalyze();
+    els.analyzeError.innerHTML =
+      '<span class="msg">Background worker is unavailable. Reload the extension on <b>chrome://extensions</b> and try again.</span>';
+    els.analyzeError.classList.remove('hidden');
+  }
+}
+
+async function cancelAnalyze() {
+  analyzeState = null;
+  renderAnalyze();
+  try { await chrome.runtime.sendMessage({ type: 'ARB_ANALYZE_CANCEL' }); } catch (_) { /* ignore */ }
+}
+
+async function retryAnalyze() {
+  // Full re-run with the same URL + current settings (robust after CAPTCHAs;
+  // a stage-level retry would not survive an eBay session invalidation).
+  if (els.ebayUrl.value.trim()) { await startAnalyze(); return; }
+  try { await chrome.runtime.sendMessage({ type: 'ARB_ANALYZE_RETRY' }); } catch (_) { /* ignore */ }
+}
+
 /* ------------------------------------------------------------------ *
  * Wiring
  * ------------------------------------------------------------------ */
@@ -571,6 +1220,39 @@ function init() {
 
   els.compare.addEventListener('click', startCompare);
   els.q.addEventListener('keydown', (e) => { if (e.key === 'Enter') startCompare(); });
+
+  // Phase 2: analyze flow wiring.
+  els.analyzeBtn.addEventListener('click', startAnalyze);
+  els.ebayUrl.addEventListener('keydown', (e) => { if (e.key === 'Enter') startAnalyze(); });
+  els.quickSettingsBtn.addEventListener('click', () => {
+    els.quickSettings.classList.toggle('hidden');
+  });
+  els.analyzeCancel.addEventListener('click', cancelAnalyze);
+  els.analyzeRetry.addEventListener('click', retryAnalyze);
+
+  // Phase 3: safety / manual match / export / blocked recovery.
+  if (els.applyAsin) els.applyAsin.addEventListener('click', applyManualMatch);
+  if (els.anAsinInput) {
+    els.anAsinInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') applyManualMatch();
+    });
+  }
+  if (els.copyBreakdown) els.copyBreakdown.addEventListener('click', copyBreakdown);
+  if (els.exportCsv) els.exportCsv.addEventListener('click', exportCsv);
+  if (els.focusBlockedTab) els.focusBlockedTab.addEventListener('click', focusBlockedTab);
+  if (els.blockedRetry) els.blockedRetry.addEventListener('click', blockedRetry);
+
+  // Restore saved analyze settings and keep them persisted + live.
+  chrome.storage.local.get('arbSettings').then((res) => {
+    if (res && res.arbSettings) applyAnalyzeSettings(res.arbSettings);
+  }).catch(() => {});
+  for (const input of [els.anEbayFeeRate, els.anFixedFee, els.anSalesTax, els.anBuffer]) {
+    input.addEventListener('change', () => {
+      saveAnalyzeSettings(readAnalyzeSettings());
+      // Instant re-render of a finished run under the new settings (no re-scrape).
+      if (analyzeState && analyzeState.phase === 'done') renderAnalyze();
+    });
+  }
 
   els.retry.addEventListener('click', forceParse);
   els.openEbay.addEventListener('click', () => openResults('ebay'));
@@ -609,8 +1291,24 @@ function init() {
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg && msg.type === 'ARB_STATE' && msg.state) {
       applyState(msg.state);
+    } else if (msg && msg.type === 'ARB_ANALYZE_STATE') {
+      if (msg.state && msg.state.phase && msg.state.phase !== 'idle') {
+        applyAnalyzeState(msg.state);
+      } else {
+        analyzeState = null; // cancelled
+        renderAnalyze();
+      }
     }
   });
+
+  // Rehydrate an in-flight/finished analyze run after popup reopen.
+  chrome.runtime.sendMessage({ type: 'ARB_ANALYZE_GET_STATE' })
+    .then((res) => {
+      if (!(res && res.ok && res.state && res.state.phase && res.state.phase !== 'idle')) return;
+      if (res.state.url && !els.ebayUrl.value) els.ebayUrl.value = res.state.url;
+      applyAnalyzeState(res.state);
+    })
+    .catch(() => { /* background asleep; it will push state on next event */ });
 
   // Ask for the current snapshot (covers popup reopen mid-run / after a run).
   // NOTE: this only ever RENDERS an existing in-flight run — it cannot start

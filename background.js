@@ -34,6 +34,28 @@
  */
 'use strict';
 
+/* Phase-1 matching engine (ebay2amazon.js): URL validation, eBay extraction,
+ * title cleaning/query building and Amazon matching. Loaded eagerly so
+ * Phase-2 orchestration (per-item lookup flow) can call self.ARBScout from
+ * any message handler. Loading it here has no side effects — the module only
+ * defines functions. See README "Phase 1" for the architecture map. */
+try { importScripts('ebay2amazon.js'); }
+catch (e) { console.warn('[arb] ebay2amazon.js failed to load:', e); }
+
+/* Phase-2 profit engine (profit.js): dropshipping profit/ROI/margin math.
+ * Pure functions — used by the analyze flow and by the legacy pairing table. */
+try { importScripts('profit.js'); }
+catch (e) { console.warn('[arb] profit.js failed to load:', e); }
+
+/* Phase-3 safety harness (safety.js): variation-mismatch guard + quantity
+ * discrepancy alerts over the matched (eBay, Amazon) pair. Pure logic. */
+try { importScripts('safety.js'); }
+catch (e) { console.warn('[arb] safety.js failed to load:', e); }
+
+/* Phase-3: orphan-tab registry + sweep (see closeOwnedTab / sweepOrphanTabs). */
+try { importScripts('cleanup.js'); }
+catch (e) { console.warn('[arb] cleanup.js failed to load:', e); }
+
 /* ------------------------------------------------------------------ *
  * Constants / config
  * ------------------------------------------------------------------ */
@@ -65,6 +87,10 @@ const DEFAULT_PAGE_LIMIT = 3;
 // Rate-limit / anti-blocking delays between Amazon page navigations (ms).
 const AMAZON_PAGE_DELAY_MIN_MS = 800;
 const AMAZON_PAGE_DELAY_MAX_MS = 3000;
+// Consecutive unavailable Amazon pages (fast redirect/error reports) the
+// analyze flow tolerates — WITH pacing — before failing the stage instead of
+// machine-gunning the remaining fallback queries.
+const ANALYZE_MAX_CONSECUTIVE_PAGE_ERRORS = 4;
 
 // Per-stage hard timeout. The content script itself is bounded; this
 // covers everything around it (navigation, first paint, message latency).
@@ -73,6 +99,60 @@ const AMAZON_PAGE_DELAY_MAX_MS = 3000;
 // case where Chrome kills the worker and never resumes it.
 const STAGE_TIMEOUT_MS = 45000;
 const ALARM_WATCHDOG_MIN = 2; // failsafe alarm, in minutes
+
+/* Phase 3: orphan-tab sweep. Chrome may kill the MV3 worker between the tab
+ * being created and any cleanup path running (the setTimeout/alarm watchdogs
+ * die with the worker), so a purely event-driven "always close on settle"
+ * guarantee is not enough on its own. Belt-and-braces: on every worker start
+ * we sweep every tab still registered from a previous life; each stage close
+ * unregisters its tab; and the periodic sweep alarm re-runs while any run is
+ * active. cleanup.js keeps the registry in chrome.storage.session. */
+const TAB_SWEEP_ALARM = 'arb.tabSweep';
+const TAB_SWEEP_MINUTES = 5;
+
+/* ------------------------------------------------------------------ *
+ * Debug instrumentation (support diagnostics)                          *
+/* ------------------------------------------------------------------ *
+ * Phase 2: single-item analyze flow (eBay URL -> Amazon match -> profit)
+ * ------------------------------------------------------------------ */
+// Same per-stage ceiling structure as the keyword run, but with more room
+// for the Phase-2 Amazon flow: the search now walks up to `pagesPerSite`
+// pages (plus up to ANALYZE_FALLBACK_QUERIES_MAX broader fallback queries),
+// so the watchdog must cover page-to-page navigation — NEVER close the tab on
+// initial load, and NEVER drop the scrape on the first page's payload.
+const ITEM_STAGE_TIMEOUT_MS = 60000;        // 60s total budget per stage
+const ITEM_ALARM_WATCHDOG_MIN = 3;          // failsafe alarm, in minutes
+// Hard cap on Amazon candidates scored per analyze (Phase 1 spec: top 5–10).
+// Deep enough that a genuine match crowded below Amazon's sponsored blocks
+// (often ranks 11–16 for niche queries) still reaches the matcher, shallow
+// enough to keep scoring and profit work bounded. Prefilter still caps at 40.
+// Total Amazon candidates aggregated across ALL pages before pagination stops.
+// MUST comfortably exceed a single page's yield (Amazon serves ~16-24 organic
+// cards/page) — at 16 it exactly equalled one page, so the cap branch settled
+// and closed the tab after page 1 every run (the "instant close" bug).
+const ANALYZE_MAX_AMAZON_ITEMS = 80;
+// Amazon pages scraped per analyze run when the popup doesn't send a setting.
+const DEFAULT_ANALYZE_PAGES_PER_SITE = 5;
+// Maximum number of broader (fallback) Amazon queries tried after a 0-result
+// page — prevents the instant "NO_AMAZON_RESULTS" drop before retrying.
+const ANALYZE_FALLBACK_QUERIES_MAX = 2;
+// Amazon items below this relevance are dropped before profit calc so the
+// "best" match is never an irrelevant listing (0 = disabled).
+const ANALYZE_MIN_CANDIDATE_SCORE = 0;
+// Default user settings for the analyze profit engine (overridable per run
+// from the popup; persisted in chrome.storage.local under 'arbSettings').
+const DEFAULT_ANALYZE_SETTINGS = {
+  ebayFeeRate: 13.25,   // % (eBay final-value fee, most categories)
+  fixedFee: 0.30,       // $ per order
+  estimatedSalesTax: 7, // % state sales tax paid when buying on Amazon
+  extraCostBuffer: 0.0, // $ misc buffer
+  pagesPerSite: DEFAULT_ANALYZE_PAGES_PER_SITE, // legacy shared cap (eBay run)
+  // NOTE: must stay null (NOT a numeric default). The reader
+  // (analyzeAmazonPagesPerSite) falls back to the legacy pagesPerSite when
+  // this is unset; a numeric default here would shadow pagesPerSite for
+  // runs started before the "Amazon pages" input existed.
+  amazonPages: null
+};
 
 /* ------------------------------------------------------------------ *
  * State helpers
@@ -131,6 +211,78 @@ async function commit() {
 function broadcast() {
   try { chrome.runtime.sendMessage({ type: 'ARB_STATE', state: cache }).catch(() => {}); }
   catch (_) { /* noop */ }
+}
+
+/* ------------------------------------------------------------------ *
+ * Phase 3: orphan-tab hygiene (registry-backed, belt AND braces)       *
+ * ------------------------------------------------------------------
+ * Every temporary scraping tab passes through closeOwnedTab(), which closes
+ * it if it still exists and unregisters it either way. sweepOrphanTabs()
+ * runs on worker start and on a periodic alarm so tabs created by a worker
+ * that Chrome then killed mid-stage can never survive as orphans. */
+
+/** Close one owned tab: remove it (best-effort) and drop it from the registry.
+ * `ownerHint` lets callers attribute the close even when they have already
+ * nulled the stage's tabId (the common settle/fail pattern) — without it the
+ * generic ownership lookup would log 'unowned' for our own closes. */
+async function closeOwnedTab(tabId, ownerHint) {
+  if (tabId == null) return;
+  try { await chrome.tabs.remove(tabId); } catch (e) { /* tab already gone */ }
+  try { await unregisterScrapeTab(tabId); } catch (_) { /* cleanup.js missing */ }
+}
+
+/** Close a list of tab ids, tolerating nulls and already-dead tabs. */
+async function closeOwnedTabs(ids) {
+  await Promise.all((ids || []).filter((t) => t != null).map(closeOwnedTab));
+}
+
+/** One sweep pass: close every registered tab that no longer belongs to a live stage. */
+async function sweepOrphanTabs() {
+  let owned = [];
+  try { owned = await getOwnedScrapeTabs(); } catch (_) { return; }
+  if (!owned.length) return;
+
+  const live = new Set();
+  if (cache && cache.sites) {
+    for (const site of ['amazon', 'ebay']) {
+      const ss = cache.sites[site];
+      if (ss && ss.tabId != null) {
+        // Live stage: keep. Blocked stage: keep too — the open tab is the
+        // user's CAPTCHA recovery surface (banner instructs them to use it).
+        if (ss.status === 'loading' ||
+            (ss.status === 'error' && ss.error === 'blocked')) live.add(ss.tabId);
+      }
+    }
+  }
+  if (analyzeCache && analyzeCache.stages) {
+    for (const stage of ['ebay', 'amazon']) {
+      const st = analyzeCache.stages[stage];
+      if (st && st.tabId != null) {
+        if (st.status === 'loading' ||
+            (st.status === 'error' && st.error === 'blocked')) live.add(st.tabId);
+      }
+    }
+  }
+
+  const orphans = owned.filter((id) => !live.has(id));
+
+  if (orphans.length) {
+    await closeOwnedTabs(orphans);
+    console.log(`[arb] tab sweep closed ${orphans.length} orphan tab(s)`);
+  }
+  try { await updateTabSweepAlarm(); } catch (_) { /* noop */ }
+}
+
+/** Keep the periodic sweep alarm alive exactly while tabs are registered. */
+async function updateTabSweepAlarm() {
+  let owned = [];
+  try { owned = await getOwnedScrapeTabs(); } catch (_) { owned = []; }
+  const existing = await chrome.alarms.get(TAB_SWEEP_ALARM).catch(() => null);
+  if (owned.length && !existing) {
+    chrome.alarms.create(TAB_SWEEP_ALARM, { delayInMinutes: TAB_SWEEP_MINUTES, periodInMinutes: TAB_SWEEP_MINUTES });
+  } else if (!owned.length && existing) {
+    chrome.alarms.clear(TAB_SWEEP_ALARM);
+  }
 }
 
 const alarmName = (runId, site) => `arb.${runId}.${site}`;
@@ -220,8 +372,7 @@ async function startRun(query, pageLimit) {
   // and close its result tabs so they can't deliver late ARB_RESULTS messages.
   if (old && old.runId && old.runId !== cache.runId) {
     clearAlarmsForRun(old.runId);
-    const ids = [old.sites.amazon.tabId, old.sites.ebay.tabId].filter((t) => t != null);
-    if (ids.length) { try { await chrome.tabs.remove(ids); } catch (_) {} }
+    await closeOwnedTabs([old.sites.amazon.tabId, old.sites.ebay.tabId]);
   }
 
   // If opening the first tab fails (rare), fail back to idle instead of
@@ -258,6 +409,7 @@ async function openSearchTab(site, opts) {
   } else {
     tab = await chrome.tabs.update(tab.id, { url, active: false });
   }
+  try { await registerScrapeTab(tab.id); await updateTabSweepAlarm(); } catch (_) { /* cleanup.js missing */ }
   ss.url = tab.url || url;
   ss.page = page;
   ss.status = 'loading';
@@ -268,6 +420,28 @@ async function openSearchTab(site, opts) {
   }
   setWatch(site);
   await commit();
+}
+
+/** A keyword-run stage settled (successfully or not): reclaim its tab. */
+async function settleSearchStage(site) {
+  const ss = cache && cache.sites && cache.sites[site];
+  const tabId = ss && ss.tabId;
+  if (tabId != null) {
+    ss.tabId = null;
+    await closeOwnedTab(tabId, `keyword-run:${site}`);
+  }
+}
+
+/**
+ * Close a keyword-run stage's tab WITHOUT clearing ss.tabId — used at the
+ * exact points where the stage is finished but state keeps a reference
+ * (e.g. "Open eBay results" may want to reopen it from its url).
+ * closeOwnedTab unregisters the id, so the sweep never re-closes it.
+ */
+async function retireSearchStageTab(site) {
+  const ss = cache && cache.sites && cache.sites[site];
+  const tabId = ss && ss.tabId;
+  if (tabId != null) await closeOwnedTab(tabId, `keyword-run:${site}`);
 }
 
 function amazonCrossReferenceQuery(fallbackQuery, ebayItems) {
@@ -303,6 +477,7 @@ function dedupeItems(items) {
 
 async function continueEbayPagination() {
   const ss = cache.sites.ebay;
+  const finishedWithEbay = () => retireSearchStageTab('ebay');
 
   // User-configured page limit (from the popup's "Pages per site" input,
   // default 3). This is the PRIMARY cap — the user explicitly said how many
@@ -339,6 +514,7 @@ async function continueEbayPagination() {
 
   ss.status = 'done';
   await commit();
+  await finishedWithEbay(); // eBay capture complete: reclaim its tab
   await openSearchTab('amazon', { page: 1, resetItems: true });
 }
 
@@ -356,6 +532,10 @@ async function continueAmazonPagination() {
     userLimit
   );
   const nextPage = (ss.page || 1) + 1;
+  // A successful page payload re-arms the one-shot price-parse retry so a
+  // later page's hydration hiccup still gets its own bounded retry.
+  ss.priceParseRetried = false;
+  ss.noResultsRetried = false; // same for the paced no-results retry
   if (nextPage <= amazonMaxPages) {
     // Rate-limit handling: add a random human-like delay between Amazon page
     // navigations to avoid triggering bot detection.
@@ -368,6 +548,7 @@ async function continueAmazonPagination() {
 
   ss.status = 'done';
   await commit();
+  await retireSearchStageTab('amazon'); // Amazon capture complete: reclaim its tab
   await finalizeRun();
 }
 
@@ -381,6 +562,9 @@ async function failStage(site, reason) {
   ss.status = 'error';
   ss.error = reason;
   clearWatch(site);
+  // Close the stage's tab on failure — EXCEPT a recoverable bot check, where
+  // the open tab is the recovery surface ("solve the CAPTCHA there").
+  if (reason !== 'blocked') await settleSearchStage(site);
   await commit();
 
   if (site === 'ebay') await openSearchTab('amazon', { page: 1, resetItems: true });
@@ -411,9 +595,50 @@ async function handleResults(msg, sender) {
     // page never produced results". Bounded reporting means we always land
     // here quickly instead of waiting on a page that will never report.
     const reason = msg.error === 'no-results-page' ? 'no-results' : msg.error;
+    if (msg.error === 'price-parse' && msg.skippedForPrice) {
+      console.log(`[arb] Amazon price parse: ${msg.skippedForPrice} cards had no parsable price`);
+    }
+    // price-parse is RECOVERABLE, not stage-fatal: the grid rendered but the
+    // prices were unreadable (usually late hydration). Keep the tab open —
+    // advance to the next page when candidates are already held, otherwise
+    // retry the SAME page once in the SAME tab (openSearchTab re-arms the
+    // watchdog) before ever failing the stage.
+    if (reason === 'price-parse' && site === 'amazon') {
+      if ((ss.items || []).length > 0) {
+        console.log(`[arb] Amazon price parse on page ${ss.page} but ${ss.items.length} items held — advancing pagination`);
+        await continueAmazonPagination();
+        return;
+      }
+      if (!ss.priceParseRetried) {
+        ss.priceParseRetried = true;
+        console.log(`[arb] price-parse with no candidates — retrying Amazon page ${ss.page || 1} once in the same tab`);
+        await new Promise((r) => setTimeout(r, AMAZON_PAGE_DELAY_MIN_MS +
+          Math.floor(Math.random() * (AMAZON_PAGE_DELAY_MAX_MS - AMAZON_PAGE_DELAY_MIN_MS + 1))));
+        await openSearchTab('amazon', { page: ss.page || 1, resetItems: false });
+        return;
+      }
+    }
+    // A fast 'no-results' (redirect interstitial / empty grid) used to close
+    // the stage tab immediately. Give it ONE paced same-page retry first —
+    // late server-side redirects often resolve into the real search page.
+    if (reason === 'no-results' && site === 'amazon' &&
+        (ss.items || []).length === 0 && !ss.noResultsRetried) {
+      ss.noResultsRetried = true;
+      console.log(`[arb] Amazon page ${ss.page || 1} redirected/empty — paced retry in the same tab`);
+      await new Promise((r) => setTimeout(r, AMAZON_PAGE_DELAY_MIN_MS +
+        Math.floor(Math.random() * (AMAZON_PAGE_DELAY_MAX_MS - AMAZON_PAGE_DELAY_MIN_MS + 1))));
+      await openSearchTab('amazon', { page: ss.page || 1, resetItems: false });
+      return;
+    }
+    // failStage closes the stage tab unless the block is recoverable
+    // (CAPTCHA) — in that case the tab stays open for the user to solve.
     await failStage(site, reason);
     return;
   }
+
+  // Success. The tab itself is intentionally KEPT here: eBay pagination
+  // reuses it via openSearchTab (tabs.update navigates in place), and the
+  // terminal points below close it explicitly.
 
   if (site === 'ebay') {
     ss.items = dedupeItems([...(ss.items || []), ...(Array.isArray(msg.items) ? msg.items : [])]);
@@ -441,6 +666,9 @@ async function finalizeRun() {
   cache.phase = 'done';
   cache.doneAt = Date.now();
   clearAllWatches();
+  // Safety net: any stage tab still referenced at finalize time is closed.
+  // (Normal flows already retire tabs in continue*Pagination / failStage.)
+  try { await closeOwnedTabs([cache.sites.ebay.tabId, cache.sites.amazon.tabId]); } catch (_) {}
 
   const amz = cache.sites.amazon.items || [];
   const ebay = cache.sites.ebay.items || [];
@@ -521,6 +749,976 @@ function computePairs(amazonItems, ebayItems) {
     if (pairs.length >= MAX_PAIRS) break;
   }
   return { pairs, amzUsed: usedA.size, ebayUsed: usedB.size };
+}
+
+/* ==================================================================== *
+ * Phase 2: analyze flow (eBay URL -> Phase 1 match -> Phase 2 profit)  *
+ * ==================================================================== */
+/*
+ * Message protocol additions:
+ *   POPUP  -> BACKGROUND
+ *     { type: 'ARB_ANALYZE', url, settings }      start an analyze run
+ *     { type: 'ARB_ANALYZE_GET_STATE' }           reply { state: analyzeState }
+ *     { type: 'ARB_ANALYZE_RETRY' }               re-scrape the stuck stage
+ *     { type: 'ARB_ANALYZE_CANCEL' }              close tabs, drop the run
+ *   CONTENT -> BACKGROUND
+ *     { type: 'ARB_ITEM_DATA', site, itemId, url, item, error }
+ *
+ *   BACKGROUND -> POPUP
+ *     { type: 'ARB_ANALYZE_STATE', state }        pushed on every change
+ *
+ * Why tabs (again): the eBay item page and the Amazon search page are opened
+ * as REAL background tabs (same rationale as the keyword run — real session,
+ * no CORS, content scripts parse pages that are genuinely open).
+ *
+ * Why chrome.storage.session (again): MV3 workers die mid-run; the analyze
+ * state survives and the popup rehydrates via ARB_ANALYZE_GET_STATE.
+ */
+
+let analyzeCache = null; // mirrors arbAnalyzeState in session storage
+
+/* Phase 3: BLOCKED recovery wording (shown verbatim by the popup). */
+const BLOCKED_STAGE_MESSAGES = {
+  ebay: 'eBay requires verification. Please complete the CAPTCHA in the opened tab and click Retry.',
+  amazon: 'Amazon requires verification. Please complete the CAPTCHA in the opened tab and click Retry.'
+};
+
+function newAmazonStage() {
+  return {
+    status: 'idle',
+    error: null,
+    tabId: null,
+    // Pagination / fallback orchestration fields (see handleAnalyzeAmazonResults):
+    queries: [],   // ordered query strings (primary first, broader fallbacks after)
+    queryIndex: 0, // active entry in `queries`
+    page: 1,       // Amazon page currently requested (&page=)
+    pagesDone: 0,  // pages successfully aggregated for the active query
+    pagesPerSite: 1, // settings.pagesPerSite (clamped 1..AMAZON_ABSOLUTE_MAX_PAGES)
+    items: []      // deduplicated candidates aggregated across pages/{queries}
+  };
+}
+
+function newAnalyzeState(url, runId, settings) {
+  return {
+    runId,
+    url: url || null,
+    phase: 'idle', // 'idle' | 'fetching-ebay' | 'searching-amazon' | 'calculating' | 'done' | 'error'
+    startedAt: null,
+    doneAt: null,
+    settings: Object.assign({}, DEFAULT_ANALYZE_SETTINGS, settings || {}),
+    manualMatch: null, // Phase 3: { asin, url, appliedAt } when user-corrected
+    stages: {
+      ebay: { status: 'idle', error: null, tabId: null },
+      amazon: newAmazonStage()
+    },
+    ebayProduct: null,
+    queryInfo: null,   // cleanTitleAndBuildQuery() result (strategy, gtin, …)
+    amazonResults: [],
+    match: null,       // matchAmazonProduct() result (candidates included)
+    safety: null,      // Phase 3: assessSafety() result for the matched pair
+    profit: null,      // calculateArbitrageProfit() result
+    error: null        // { code, message, userMessage }
+  };
+}
+
+async function ensureAnalyzeState() {
+  if (analyzeCache) return analyzeCache;
+  try {
+    const res = await chrome.storage.session.get('arbAnalyzeState');
+    analyzeCache = res.arbAnalyzeState || null;
+  } catch (_) { analyzeCache = null; }
+  return analyzeCache;
+}
+
+async function commitAnalyze() {
+  try { await chrome.storage.session.set({ arbAnalyzeState: analyzeCache }); } catch (_) { /* noop */ }
+  broadcastAnalyze();
+}
+
+function broadcastAnalyze() {
+  try { chrome.runtime.sendMessage({ type: 'ARB_ANALYZE_STATE', state: analyzeCache }).catch(() => {}); }
+  catch (_) { /* noop */ }
+}
+
+const itemAlarmName = (runId, stage) => `arbItem.${runId}.${stage}`;
+const itemStageTimers = {};
+
+function setItemWatch(stage) {
+  if (!analyzeCache) return;
+  const runId = analyzeCache.runId;
+  clearItemWatch(stage);
+  itemStageTimers[stage] = setTimeout(() => {
+    delete itemStageTimers[stage];
+    handleItemStageTimeout(runId, stage).catch((e) => console.warn('[arb] item watchdog error:', e));
+  }, ITEM_STAGE_TIMEOUT_MS);
+  try { chrome.alarms.create(itemAlarmName(runId, stage), { delayInMinutes: ITEM_ALARM_WATCHDOG_MIN }); } catch (_) {}
+}
+
+function clearItemWatch(stage) {
+  if (itemStageTimers[stage]) { clearTimeout(itemStageTimers[stage]); delete itemStageTimers[stage]; }
+  try { if (analyzeCache) chrome.alarms.clear(itemAlarmName(analyzeCache.runId, stage)); } catch (_) {}
+}
+
+function clearAllItemWatches() {
+  for (const stage of ['ebay', 'amazon']) clearItemWatch(stage);
+}
+
+async function handleItemStageTimeout(runId, stage) {
+  await ensureAnalyzeState();
+  if (!analyzeCache || analyzeCache.runId !== runId) return;
+  const st = analyzeCache.stages[stage];
+  if (!st || st.status !== 'loading') return;
+  await failAnalyzeStage(stage, 'timeout');
+}
+
+/** Open a tab for a stage and arm its watchdog. */
+async function openAnalyzeTab(stage, url) {
+  const st = analyzeCache.stages[stage];
+  let tab = null;
+  try { tab = await chrome.tabs.get(st.tabId); } catch (_) { tab = null; }
+  if (!tab) {
+    tab = await chrome.tabs.create({ url, active: false });
+    st.tabId = tab.id;
+  } else {
+    tab = await chrome.tabs.update(tab.id, { url, active: false });
+  }
+  try { await registerScrapeTab(tab.id); await updateTabSweepAlarm(); } catch (_) { /* cleanup.js missing */ }
+  st.url = tab.url || url;
+  st.status = 'loading';
+  st.error = null;
+  setItemWatch(stage);
+  await commitAnalyze();
+  console.log(`[ARBScout] ${stage === 'amazon' ? 'Amazon' : 'eBay'} tab opened:`, tab.id);
+}
+
+/**
+ * Navigate the (reused) Amazon search tab to a specific query/page. This is
+ * the ONLY navigator the pagination loop uses: it keeps the tab OPEN while
+ * content.js parses (never a quick 3s drop), re-arms the stage watchdog, and
+ * records which page the reply must be aligned to.
+ */
+async function navigateAnalyzeAmazonTab(query, page) {
+  const st = analyzeCache.stages.amazon;
+  const url = self.ARBScout.buildAmazonSearchUrl(query, page);
+  let tab = null;
+  try { tab = await chrome.tabs.get(st.tabId); } catch (_) { tab = null; }
+  if (!tab) {
+    tab = await chrome.tabs.create({ url, active: false });
+  } else {
+    tab = await chrome.tabs.update(tab.id, { url, active: false });
+  }
+  st.tabId = tab.id;
+  st.url = tab.url || url;
+  st.status = 'loading';
+  st.error = null;
+  st.page = page;
+  try { await registerScrapeTab(tab.id); await updateTabSweepAlarm(); } catch (_) { /* cleanup.js missing */ }
+  setItemWatch('amazon');
+  await commitAnalyze();
+  console.log(`[ARBScout] Amazon tab opened (page ${page}/${analyzeAmazonPagesPerSite()}):`, tab.id, { query: String(query).slice(0, 60) });
+}
+
+async function failAnalyzeStage(stage, reason) {
+  await ensureAnalyzeState();
+  if (!analyzeCache) return;
+  const st = analyzeCache.stages[stage];
+  if (!st || st.status !== 'loading') return;
+  st.status = 'error';
+  st.error = reason;
+  clearItemWatch(stage);
+  // Phase 3: the failed stage's tab is only needed for CAPTCHA recovery —
+  // keep it OPEN when the block is recoverable (user solves it in place),
+  // close it otherwise (timeout/parse failures can't be fixed in-tab).
+  if (reason !== 'blocked') {
+    const tabId = st.tabId;
+    st.tabId = null;
+    await closeOwnedTab(tabId, `analyze:${stage}`);
+  }
+  analyzeCache.phase = 'error';
+  analyzeCache.error = analyzeErrorFor(stage, reason);
+  await commitAnalyze();
+}
+
+/** Map stage failures onto the MatchError codes the popup already knows. */
+function analyzeErrorFor(stage, reason) {
+  const map = {
+    'ebay:invalid-url': ['INVALID_URL', 'That doesn\'t look like a valid eBay listing URL.'],
+    'ebay:not-ebay': ['NOT_EBAY_ITEM', 'Paste an eBay product page (ebay.com/itm/…), not a search or profile link.'],
+    'ebay:blocked': ['FETCH_FAILED', BLOCKED_STAGE_MESSAGES.ebay],
+    'ebay:timeout': ['TIMEOUT', 'The eBay listing took too long to load. Try again.'],
+    'ebay:no-title': ['NO_TITLE', 'The eBay listing had no readable title.'],
+    'ebay:parse-failed': ['PARSE_FAILED', 'Couldn\'t read the eBay listing — its layout may have changed.'],
+    'ebay:closed': ['FETCH_FAILED', 'The eBay tab was closed before it could be read.'],
+    'amazon:blocked': ['NO_AMAZON_RESULTS', BLOCKED_STAGE_MESSAGES.amazon],
+    'amazon:timeout': ['NO_AMAZON_RESULTS', 'Amazon search timed out. Try again.'],
+    'amazon:no-results': ['NO_AMAZON_RESULTS', 'No Amazon results came back for this product.'],
+    'amazon:parse-failed': ['NO_AMAZON_RESULTS', 'Amazon results could not be parsed — layout may have changed.'],
+    'amazon:closed': ['NO_AMAZON_RESULTS', 'The Amazon tab was closed before it could be read.'],
+    'amazon:asin-invalid': ['ASIN_INVALID', 'That is not a valid Amazon ASIN or product URL.']
+  };
+  const hit = map[`${stage}:${reason}`] || ['FETCH_FAILED', `The ${stage} step failed (${reason}).`];
+  return { code: hit[0], message: `${stage}: ${reason}`, userMessage: hit[1] };
+}
+
+/** Start an analyze run (the ONLY place analyze phase leaves 'idle'). */
+async function startAnalyze(rawUrl, settings) {
+  await ensureAnalyzeState();
+
+  // Close the previous run's tabs so late ARB_ITEM_DATA/ARB_RESULTS messages
+  // from stale tabs can never inject into the new run.
+  if (analyzeCache && analyzeCache.stages) {
+    const prevTabs = [analyzeCache.stages.ebay.tabId, analyzeCache.stages.amazon.tabId]
+      .filter((t) => t != null);
+    if (prevTabs.length) {
+      console.log(`[ARBScout] previous run phase='${analyzeCache.phase}' — closing its tab(s) [${prevTabs.join(', ')}]`);
+    }
+    clearAllItemWatches();
+    await closeOwnedTabs([analyzeCache.stages.ebay.tabId, analyzeCache.stages.amazon.tabId]);
+  }
+
+  let canonical;
+  try {
+    canonical = self.ARBScout.validateEbayUrl(rawUrl);
+  } catch (err) {
+    analyzeCache = newAnalyzeState(null, `a${Date.now()}`, settings);
+    analyzeCache.phase = 'error';
+    analyzeCache.error = { code: err.code || 'INVALID_URL', message: err.message, userMessage: err.userMessage || String(err.message || err) };
+    await commitAnalyze();
+    return;
+  }
+
+  analyzeCache = newAnalyzeState(canonical.canonicalUrl, `a${Date.now()}`, settings);
+  analyzeCache.phase = 'fetching-ebay';
+  analyzeCache.startedAt = Date.now();
+  await commitAnalyze();
+
+  try {
+    await openAnalyzeTab('ebay', canonical.canonicalUrl);
+  } catch (e) {
+    console.warn('[arb] could not open eBay item tab:', e);
+    await failAnalyzeStage('ebay', 'parse-failed');
+  }
+}
+
+/** Handle ARB_ITEM_DATA from content-item.js (eBay stage completion). */
+async function handleItemData(msg, sender) {
+  await ensureAnalyzeState();
+  if (!analyzeCache || analyzeCache.phase !== 'fetching-ebay') return;
+  const st = analyzeCache.stages.ebay;
+  if (st.status !== 'loading') return;
+  const senderTabId = sender && sender.tab ? sender.tab.id : null;
+  if (st.tabId != null && senderTabId !== st.tabId) return;
+  if (msg.itemId && analyzeCache.url) {
+    const expected = (analyzeCache.url.match(/\/itm\/(\d{9,15})/) || [])[1];
+    if (expected && msg.itemId !== expected) return; // stale tab guard
+  }
+
+  clearItemWatch('ebay');
+
+  if (msg.error || !msg.item) {
+    // failAnalyzeStage closes the tab unless the block is recoverable.
+    await failAnalyzeStage('ebay', msg.error || 'parse-failed');
+    return;
+  }
+
+  // Success: the eBay stage settled — reclaim its tab immediately.
+  {
+    const tabId = st.tabId;
+    st.tabId = null;
+    await closeOwnedTab(tabId, 'analyze:ebay');
+  }
+
+  st.status = 'done';
+  analyzeCache.ebayProduct = msg.item;
+  await commitAnalyze();
+  await analyzeBuildQueryAndSearch();
+}
+
+/**
+ * Amazon query straight from the eBay title ("search the same title we found").
+ * Transport-level sanitization only — never rewrites the product wording:
+ *   - collapse runs of whitespace (eBay titles often carry double spaces)
+ *   - strip dangling quotes/parens/brackets/pipes at the ends
+ *     (real titles end like ... 3/4" Bearings ( )
+ *   - cap at 250 chars (Amazon's own search-box limit), then re-trim any
+ *     punctuation the cut left dangling.
+ * Returns '' for an unusable title — the plan builder filters that out and
+ * the cleaned query becomes the primary.
+ */
+function exactTitleQuery(rawTitle) {
+  let t = String(rawTitle || '').replace(/\s+/g, ' ').trim();
+  if (!t) return '';
+  // Always-junk edge characters (never meaningful at the very ends). Parens
+  // and brackets are NOT here — they are handled by the balance check below
+  // so titles like "(2 Pack) YITAMOTOR …" or "… (Black)" survive intact.
+  const JUNK = '[\\s"\'`|,;:\\-–—]';
+  t = t.replace(new RegExp('^' + JUNK + '+'), '').replace(new RegExp(JUNK + '+$'), '');
+  // Dangling OPENERS at the end ("… 3/4\" Bearings ("): an opener with no
+  // matching closer left in the string is truncation junk — strip it. A
+  // trailing CLOSER is meaningful and kept. Mirror logic for stray closers
+  // at the start.
+  const OPENERS = { '(': ')', '[': ']', '{': '}' };
+  for (let guard = 0; guard < 4; guard++) {
+    const ch = t.slice(-1);
+    if (!OPENERS[ch]) break;
+    const closer = OPENERS[ch];
+    if ((t.split(ch).length - 1) > (t.split(closer).length - 1)) t = t.slice(0, -1).trim();
+    else break;
+  }
+  for (let guard = 0; guard < 4; guard++) {
+    const ch = t.slice(0, 1);
+    const opener = ch === ')' ? '(' : ch === ']' ? '[' : ch === '}' ? '{' : null;
+    if (!opener) break;
+    if ((t.split(ch).length - 1) > (t.split(opener).length - 1)) t = t.slice(1).trim();
+    else break;
+  }
+  if (t.length > 250) t = t.slice(0, 250).replace(new RegExp(JUNK + '+$'), '');
+  return t.trim();
+}
+
+/** Clean the title, build the query + broader fallbacks, open Amazon page 1. */
+async function analyzeBuildQueryAndSearch() {
+  await ensureAnalyzeState();
+  const item = analyzeCache.ebayProduct;
+  let q;
+  try {
+    q = self.ARBScout.cleanTitleAndBuildQuery(item.title, item.specifics || {});
+  } catch (err) {
+    analyzeCache.phase = 'error';
+    analyzeCache.error = { code: err.code || 'NO_QUERY', message: err.message, userMessage: err.userMessage || String(err.message || err) };
+    await commitAnalyze();
+    return;
+  }
+  analyzeCache.queryInfo = {
+    query: q.query,
+    strategy: q.strategy,
+    gtin: q.gtin,
+    bundleQuantity: q.bundleQuantity,
+    cleanedTitle: q.cleanedTitle
+  };
+
+  // Ordered query plan. PRIMARY = the eBay product's own title, searched on
+  // Amazon as-is (sanitized only for transport: whitespace collapsed, dangling
+  // punctuation stripped, capped at Amazon's search-box limit). Amazon's
+  // relevance ranking puts exact-title matches first, so this maximizes the
+  // chance the same product is result #1 — without depending on how well the
+  // title cleaner extracted brand/model tokens. The cleaned query and the
+  // broader fallbacks are kept BEHIND it as recovery tiers for the rare case
+  // the exact title returns 0 results.
+  const fallbacks = (typeof self.ARBScout.buildFallbackQueries === 'function')
+    ? (self.ARBScout.buildFallbackQueries(item, q) || [])
+        .filter((s) => typeof s === 'string' && s.trim())
+        .slice(0, ANALYZE_FALLBACK_QUERIES_MAX)
+    : [];
+  const plan = [exactTitleQuery(item.title), q.query, ...fallbacks]
+    .filter((x) => typeof x === 'string' && x.trim())
+    .filter((x, i, arr) => arr.indexOf(x) === i); // dedupe
+
+  const st = analyzeCache.stages.amazon;
+  st.queries = plan;
+  st.queryIndex = 0;
+  st.page = 1;
+  st.pagesDone = 0;
+  st.items = [];
+  st.priceParseRetried = false;
+  st.pagesPerSite = analyzeAmazonPagesPerSite();
+  analyzeCache.phase = 'searching-amazon';
+  await commitAnalyze();
+  console.log(`[ARBScout] Amazon query plan (${plan.length}):`, plan);
+
+  try {
+    await navigateAnalyzeAmazonTab(st.queries[0], 1);
+  } catch (e) {
+    console.warn('[arb] could not open Amazon tab:', e);
+    await failAnalyzeStage('amazon', 'parse-failed');
+  }
+}
+
+/**
+ * Handle ARB_RESULTS from the Amazon search tab while an analyze run is in
+ * the 'searching-amazon' phase. The legacy keyword-run path in handleResults()
+ * ignores these (phase gate), so the two flows never collide.
+ *
+ * Pagination + fallback pipeline (this is the fix for the premature-close bug):
+ *   1. The Amazon tab is NEVER closed on its first payload. Each reply is
+ *      accepted only when aligned (same sender tab, same ?k=, same ?page=).
+ *   2. Items are aggregated into st.items across up to `pagesPerSite` pages,
+ *      which the background drives by updating the SAME tab's URL (&page=…).
+ *   3. A 0-result / empty page either ends a product-query (candidates exist)
+ *      or activates the next BROADER fallback query in the same tab session —
+ *      only after the whole plan is exhausted do we fail NO_AMAZON_RESULTS.
+ */
+async function handleAnalyzeAmazonResults(msg, sender) {
+  await ensureAnalyzeState();
+  if (!analyzeCache || analyzeCache.phase !== 'searching-amazon') return;
+  const st = analyzeCache.stages.amazon;
+  if (!st || st.status !== 'loading') {
+    return;
+  }
+
+  const senderTabId = sender && sender.tab ? sender.tab.id : null;
+  if (st.tabId != null && senderTabId !== st.tabId) {
+    return;
+  }
+
+  // Alignment guards dodge stale payloads from earlier pages/queries.
+  const activeQuery = analyzeCurrentQuery();
+  if (!activeQuery) return;
+  const msgPage = (Number.isInteger(Math.floor(Number(msg.page))) ? Math.floor(Number(msg.page)) : 1);
+  if (st.page && Number.isInteger(st.page) && msgPage !== st.page) {
+    if (msgPage > st.page) return;
+    // Amazon silently redirects an out-of-range page (e.g. ?page=7 of a
+    // 3-page result set) back to an earlier page. The pagination window is
+    // over: settle on what we already hold instead of hanging until the
+    // watchdog fires and reporting NO_AMAZON_RESULTS despite good data.
+    console.log(`[ARBScout] Amazon redirected page ${st.page} -> ${msgPage}; end of pagination`);
+    if ((st.items || []).length > 0) await settleAnalyzeAmazonStage('Amazon redirected to an earlier page (end of pagination)');
+    else await advanceAnalyzeNextQueryOrFail();
+    return;
+  }
+  if (msg.query && typeof msg.query === 'string' &&
+      msg.query.trim().toLowerCase() !== activeQuery.toLowerCase()) {
+    return;
+  }
+
+  clearItemWatch('amazon');
+
+  /* ---- Failed page payload ------------------------------------------ */
+  if (msg.error) {
+    if (msg.error === 'price-parse' && msg.skippedForPrice) {
+      console.log(`[ARBScout] Amazon price parse: ${msg.skippedForPrice} cards had no parsable price`);
+    }
+    // Manual-ASIN flow: a dp page that neither loads nor blocks just means
+    // the ASIN is wrong/unavailable — say that instead of a generic failure.
+    if (analyzeCache.manualMatch && msg.error !== 'blocked' && msg.error !== 'timeout') {
+      const tabId = st.tabId;
+      st.tabId = null;
+      await closeOwnedTab(tabId, 'analyze:amazon');
+      st.status = 'error';
+      st.error = msg.error;
+      analyzeCache.phase = 'error';
+      analyzeCache.error = {
+        code: 'NO_AMAZON_RESULTS',
+        message: `asin page: ${msg.error}`,
+        userMessage: 'The Amazon product page for that ASIN could not be read — it may not exist or is unavailable in your region.'
+      };
+      await commitAnalyze();
+      return;
+    }
+    await handleAnalyzeQueryError(msg.error);
+    return;
+  }
+
+  /* ---- Success: aggregate this page's candidates -------------------- */
+  const pageItems = Array.isArray(msg.items) ? msg.items : [];
+  console.log('[ARBScout] Received payload from Amazon content script:', pageItems.length);
+  // A successful page re-arms the one-shot price-parse retry budget.
+  st.priceParseRetried = false;
+  st.consecutivePageErrors = 0; // a live page breaks the consecutive-error streak
+  st.pagesDone = Math.max(st.pagesDone || 0, msgPage);
+  st.items = mergeAnalyzeAmazonItems(st.items || [], pageItems);
+  await commitAnalyze();
+
+  // Manual-ASIN single /dp page: terminal — no pagination, close + finalize.
+  if (analyzeCache.manualMatch) {
+    await settleAnalyzeAmazonStage('manual ASIN match complete');
+    return;
+  }
+
+  // 0 items on this page: if we already hold candidates, settle on them;
+  // otherwise test the next broader fallback query before ever dropping.
+  if (!pageItems.length) {
+    if ((st.items || []).length > 0) {
+      await settleAnalyzeAmazonStage('end of results with held candidates');
+    } else {
+      await advanceAnalyzeNextQueryOrFail();
+    }
+    return;
+  }
+
+  // Candidate cap reached — no point crawling more pages.
+  if ((st.items || []).length >= ANALYZE_MAX_AMAZON_ITEMS) {
+    console.log(`[ARBScout] Reached candidate cap ${ANALYZE_MAX_AMAZON_ITEMS} — enough candidates collected; finishing early (tab closes by design, match continues)`);
+    await settleAnalyzeAmazonStage('candidate cap reached');
+    return;
+  }
+
+  // Last requested page consumed — settle (pagination window over).
+  const pagesPer = analyzeAmazonPagesPerSite();
+  if (msgPage >= pagesPer) {
+    console.log(`[ARBScout] Amazon page ${msgPage}/${pagesPer} parsed — pagination complete`);
+    await settleAnalyzeAmazonStage('pagination window complete');
+    return;
+  }
+
+  // Keep the SAME tab open and crawl the next page with a human-like pause.
+  const nextDelay = AMAZON_PAGE_DELAY_MIN_MS +
+    Math.floor(Math.random() * (AMAZON_PAGE_DELAY_MAX_MS - AMAZON_PAGE_DELAY_MIN_MS + 1));
+  await new Promise((resolve) => setTimeout(resolve, nextDelay));
+  if (!analyzeCache || analyzeCache.phase !== 'searching-amazon' ||
+      analyzeCache.stages.amazon.status !== 'loading') return;
+  console.log(`[ARBScout] Crawling Amazon page ${msgPage + 1}/${pagesPer} of query "${String(activeQuery).slice(0, 40)}"`);
+  await navigateAnalyzeAmazonTab(activeQuery, msgPage + 1);
+}
+
+/**
+ * React to a per-page error from the Amazon tab. 'blocked' / 'timeout' fail
+ * the stage immediately (the CAPTCHA tab stays open for 'blocked'). Other
+ * errors only fail after the fallback query plan is exhausted — if we already
+ * collected candidates, an odd parse error on a later page settles the run.
+ *
+ * 'price-parse' (grid rendered but no card yielded a parsable price) is
+ * recoverable: with candidates held we settle on them; with none we retry the
+ * SAME query/page ONCE in the same tab (late price hydration is the usual
+ * cause) before spending a fallback query on it. The tab is never closed on
+ * a first price-parse miss.
+ */
+async function handleAnalyzeQueryError(reason) {
+  const st = analyzeCache.stages.amazon;
+  if (reason === 'blocked' || reason === 'timeout') {
+    await failAnalyzeStage('amazon', reason);
+    return;
+  }
+  if ((st.items || []).length > 0) {
+    console.log(`[ARBScout] Amazon page error "${reason}" but ${st.items.length} candidates exist — settling on scraped data`);
+    await settleAnalyzeAmazonStage('page error with held candidates');
+    return;
+  }
+  if (reason === 'price-parse' && !st.priceParseRetried) {
+    st.priceParseRetried = true;
+    const query = analyzeCurrentQuery();
+    const page = st.page || 1;
+    console.log(`[ARBScout] Amazon price parse failed with 0 candidates — retrying "${String(query).slice(0, 40)}" page ${page} once in the same tab`);
+    await new Promise((resolve) => setTimeout(resolve, AMAZON_PAGE_DELAY_MIN_MS +
+      Math.floor(Math.random() * (AMAZON_PAGE_DELAY_MAX_MS - AMAZON_PAGE_DELAY_MIN_MS + 1))));
+    try {
+      await navigateAnalyzeAmazonTab(query, page);
+    } catch (e) {
+      console.warn('[ARBScout] price-parse retry navigation failed:', e && e.message);
+      await advanceAnalyzeNextQueryOrFail();
+    }
+    return;
+  }
+  // Remaining errors advance the query plan. Redirect interstitials (sign-in
+  // / bot-wall pages that dodged isBlockedPage) report fast, so advancing
+  // without pacing machine-guns the whole plan in ~1s and slams the tab shut
+  // with NO_AMAZON_RESULTS — the exact "closes after 1-2 seconds" symptom.
+  // Pace every advance like a human page turn, and cap consecutive dead
+  // pages so a hard block terminates cleanly instead of burning the plan.
+  if ((st.items || []).length === 0) {
+    st.consecutivePageErrors = (st.consecutivePageErrors || 0) + 1;
+    if (st.consecutivePageErrors > ANALYZE_MAX_CONSECUTIVE_PAGE_ERRORS) {
+      console.log(`[ARBScout] ${ANALYZE_MAX_CONSECUTIVE_PAGE_ERRORS}+ consecutive unavailable Amazon pages — failing before burning the query plan`);
+      await failAnalyzeStage('amazon', 'no-results');
+      return;
+    }
+    const delay = AMAZON_PAGE_DELAY_MIN_MS +
+      Math.floor(Math.random() * (AMAZON_PAGE_DELAY_MAX_MS - AMAZON_PAGE_DELAY_MIN_MS + 1));
+    console.log(`[ARBScout] Amazon page unavailable (${reason}) — pacing ${delay}ms before next step`);
+    await new Promise((resolve) => setTimeout(resolve, delay));
+  }
+  await advanceAnalyzeNextQueryOrFail();
+}
+
+/**
+ * Move the SAME tab to the next broader fallback query (page 1), or fail the
+ * stage once every query in the plan returned nothing.
+ */
+async function advanceAnalyzeNextQueryOrFail() {
+  const st = analyzeCache.stages.amazon;
+  const queryPlan = Array.isArray(st.queries) && st.queries.length ? st.queries : null;
+  const nextIndex = (st.queryIndex || 0) + 1;
+  if (!queryPlan || nextIndex >= queryPlan.length) {
+    console.log(`[ARBScout] All ${queryPlan ? queryPlan.length : 0} Amazon queries returned no results`);
+    await failAnalyzeStage('amazon', 'no-results');
+    return;
+  }
+  st.queryIndex = nextIndex;
+  st.page = 1;
+  st.pagesDone = 0;
+  st.items = []; // fresh aggregation for the fallback query
+  st.priceParseRetried = false; // fresh retry budget for the new query
+  const query = queryPlan[nextIndex];
+  console.log(`[ARBScout] Amazon 0 results — fallback query ${nextIndex + 1}/${queryPlan.length}:`, query);
+  await navigateAnalyzeAmazonTab(query, 1);
+}
+
+/**
+ * Terminal success path for the Amazon stage: reclaim the tab, record the
+ * deduplicated candidates and hand off to match + profit. This is the ONLY
+ * place the analyze Amazon tab is closed on success — pagination and the
+ * fallback loop never close it early.
+ */
+async function settleAnalyzeAmazonStage(reason) {
+  await ensureAnalyzeState();
+  if (!analyzeCache) return;
+  const st = analyzeCache.stages.amazon;
+  const tabId = st.tabId;
+  st.tabId = null;
+  await closeOwnedTab(tabId, 'analyze:amazon');
+  st.status = 'done';
+  analyzeCache.amazonResults = (st.items || []).slice(0, ANALYZE_MAX_AMAZON_ITEMS);
+  console.log(`[ARBScout] Amazon stage done — ${analyzeCache.amazonResults.length} candidates for matching`);
+  await commitAnalyze();
+  await finalizeAnalyze();
+}
+
+/** (Re)establish the Amazon stage's pagination metadata (survives restarts). */
+function ensureAnalyzeAmazonPlan() {
+  const st = analyzeCache.stages.amazon;
+  if (!st.queries || !st.queries.length) {
+    st.queries = (analyzeCache.queryInfo && analyzeCache.queryInfo.query)
+      ? [analyzeCache.queryInfo.query]
+      : [];
+  }
+  if (!Number.isInteger(st.queryIndex) || st.queryIndex < 0) st.queryIndex = 0;
+  if (!Number.isInteger(st.page) || st.page < 1) st.page = 1;
+  if (!Number.isInteger(st.pagesDone) || st.pagesDone < 0) st.pagesDone = 0;
+  if (!Number.isInteger(st.pagesPerSite) || st.pagesPerSite < 1) st.pagesPerSite = analyzeAmazonPagesPerSite();
+  if (!Array.isArray(st.items)) st.items = [];
+}
+
+/** The query string currently being scraped by the pagination loop (or null). */
+function analyzeCurrentQuery() {
+  const st = analyzeCache.stages.amazon;
+  const list = (Array.isArray(st.queries) && st.queries.length)
+    ? st.queries
+    : (analyzeCache.queryInfo && analyzeCache.queryInfo.query ? [analyzeCache.queryInfo.query] : []);
+  if (!list.length) return null;
+  return list[Math.max(0, Math.min(st.queryIndex || 0, list.length - 1))];
+}
+
+/** Clamp the user's pages-per-site (settings) to the safe ceiling. */
+function analyzeAmazonPagesPerSite() {
+  const s = analyzeCache && analyzeCache.settings;
+  // The dedicated "Amazon pages" input wins; fall back to the legacy shared
+  // "Pages per site" value for runs started before that input existed.
+  const raw = s && s.amazonPages != null ? s.amazonPages : s && s.pagesPerSite;
+  let n = Math.floor(Number(raw));
+  if (!Number.isInteger(n) || n < 1) n = DEFAULT_ANALYZE_PAGES_PER_SITE;
+  return Math.min(AMAZON_ABSOLUTE_MAX_PAGES, n);
+}
+
+/** Merge incoming page items into the running list, de-duplicating by ASIN. */
+function mergeAnalyzeAmazonItems(existing, incoming) {
+  const out = Array.isArray(existing) ? existing.slice() : [];
+  const seen = new Set();
+  for (const it of out) {
+    const key = it && (it.id || it.asin);
+    if (key) seen.add(key);
+  }
+  for (const it of incoming || []) {
+    if (!it) continue;
+    const key = it.id || it.asin;
+    if (key && seen.has(key)) continue;
+    if (key) seen.add(key);
+    out.push(it);
+    if (out.length >= ANALYZE_MAX_AMAZON_ITEMS) break;
+  }
+  return out;
+}
+/** Match + profit (pure computation, no tabs). */
+async function finalizeAnalyze() {
+  await ensureAnalyzeState();
+  if (!analyzeCache) return;
+
+  analyzeCache.phase = 'calculating';
+  await commitAnalyze();
+
+  const item = analyzeCache.ebayProduct;
+  const results = analyzeCache.amazonResults;
+
+  const match = self.ARBScout.matchAmazonProduct(item, results);
+  // POPUP CONTRACT: renderAnalyzeResult() reads st.match.bestMatch for the
+  // Amazon product card, the profit recompute, the safety box and CSV export.
+  // It must be the ACCEPTED match (matchedAmazon) — never the matcher's raw
+  // bestMatch (top-scored candidate even when below threshold) — or the popup
+  // would render/compute profit from a rejected candidate. Leaving it unset
+  // (the old bug) rendered an "81% match" badge with an EMPTY product card.
+  analyzeCache.match = {
+    matched: match.matched,
+    confidence: match.confidence,
+    strategy: match.strategy,
+    warnings: match.warnings || [],
+    candidates: match.candidates,
+    matches: match.matches || [],
+    bestMatch: match.matchedAmazon || null,
+    matchedAmazon: match.matchedAmazon || null,
+    errorCode: match.error ? match.error.code : null,
+    errorMessage: match.error ? match.error.message : null
+  };
+
+  // One-line diagnostics: everything needed to explain a no-match remotely —
+  // what the matcher was given (eBay side), how many Amazon candidates it
+  // had, and how the top candidates actually scored, signal by signal.
+  try {
+    console.log('[ARBScout] Match summary:', JSON.stringify({
+      ebay: item ? {
+        title: String(item.title || '').slice(0, 60),
+        price: item.price, quantity: item.quantity,
+        brand: item.specifics && item.specifics.brand,
+        model: item.specifics && (item.specifics.model || item.specifics.mpn)
+      } : null,
+      candidatesGiven: Array.isArray(results) ? results.length : 0,
+      matched: match.matched,
+      confidence: match.confidence,
+      warnings: match.warnings || [],
+      top3: (match.candidates || []).slice(0, 3).map((c) => ({
+        score: `${Math.round((c.score || 0) * 100)}%`,
+        asin: c.asin,
+        title: String(c.title || '').slice(0, 50),
+        signals: c.signals
+      }))
+    }));
+  } catch (_) { /* diagnostics must never break the run */ }
+
+  // Phase 2 bug fix: use the ACCEPTED match (>= confidence threshold) when
+  // present, not just the top-scored candidate. matchedAmazon is null when
+  // nothing was accepted, so `best` falls back to bestMatch only for display
+  // purposes ("No confident match found" card) — profit is NEVER computed
+  // from a below-threshold candidate anymore.
+  const best = match.matchedAmazon || null;
+  if (best) {
+    // Phase 2 profit engine with the run's (user-configurable) settings.
+    const profit = self.ARBProfit.calculateArbitrageProfit(
+      { price: item.price, shipping: item.shipping },
+      { price: best.price, shipping: best.shipping || 0, isPrime: !!best.isPrime },
+      analyzeCache.settings
+    );
+    analyzeCache.profit = profit;
+    // Phase 3 safety harness: variation + quantity guards over the exact
+    // pair the profit was computed from.
+    try {
+      if (self.ARBSafety) {
+        analyzeCache.safety = self.ARBSafety.assessSafety(item, best);
+      }
+    } catch (e) { console.warn('[arb] safety assessment failed:', e); }
+  }
+
+  analyzeCache.phase = 'done';
+  analyzeCache.doneAt = Date.now();
+  if (!best) {
+    analyzeCache.error = {
+      code: match.error ? match.error.code : 'LOW_CONFIDENCE',
+      message: match.error ? match.error.message : 'no match',
+      userMessage: match.error ? match.error.userMessage : 'No confident Amazon match was found.'
+    };
+  }
+  clearAllItemWatches();
+  await commitAnalyze();
+}
+
+/**
+ * Phase 3: manual match correction. The popup pastes a verified Amazon ASIN
+ * or product URL when automatic confidence is low (<75%); we re-open the
+ * exact product page, parse it, and recalculate profit + safety against the
+ * real listing — no guesswork left in the pipeline.
+ */
+async function applyManualMatch(input) {
+  await ensureAnalyzeState();
+  if (!analyzeCache) return;
+  if (!analyzeCache.ebayProduct) {
+    analyzeCache.phase = 'error';
+    analyzeCache.error = {
+      code: 'ASIN_INVALID',
+      message: 'manual match without an eBay product',
+      userMessage: 'Run the analyze flow first — paste an eBay URL and Analyze, then correct the match.'
+    };
+    await commitAnalyze();
+    return;
+  }
+
+  let asinInfo;
+  try {
+    asinInfo = self.ARBScout.validateAmazonAsin(input);
+  } catch (err) {
+    analyzeCache.phase = 'error';
+    analyzeCache.error = {
+      code: err.code || 'ASIN_INVALID',
+      message: err.message,
+      userMessage: err.userMessage || 'Paste an Amazon ASIN (B0XXXXXXXXXX) or product URL.'
+    };
+    await commitAnalyze();
+    return;
+  }
+
+  // Fresh run shell reusing the already-parsed eBay product; the Amazon
+  // stage now targets the exact dp URL.
+  const next = newAnalyzeState(analyzeCache.url, `a${Date.now()}`, analyzeCache.settings);
+  next.ebayProduct = analyzeCache.ebayProduct;
+  next.queryInfo = analyzeCache.queryInfo;
+  next.manualMatch = { asin: asinInfo.asin, url: asinInfo.url, appliedAt: Date.now() };
+  next.phase = 'searching-amazon';
+  next.startedAt = Date.now();
+
+  // Close the old run's tabs/watchdogs before swapping state.
+  clearAllItemWatches();
+  await closeOwnedTabs([
+    analyzeCache.stages && analyzeCache.stages.ebay && analyzeCache.stages.ebay.tabId,
+    analyzeCache.stages && analyzeCache.stages.amazon && analyzeCache.stages.amazon.tabId
+  ]);
+
+  analyzeCache = next;
+  await commitAnalyze();
+  try {
+    await openAnalyzeTab('amazon', asinInfo.url);
+  } catch (e) {
+    console.warn('[arb] could not open manual-ASIN tab:', e);
+    await failAnalyzeStage('amazon', 'parse-failed');
+  }
+}
+
+/** Popup wants the blocked stage's tab brought to the front (CAPTCHA recovery). */
+async function focusAnalyzeStageTab(stage) {
+  await ensureAnalyzeState();
+  if (!analyzeCache) return;
+  const st = analyzeCache.stages && analyzeCache.stages[stage];
+  if (!st || st.tabId == null) return;
+  try {
+    // Activate the tab, then lift its WINDOW (windows.update expects a window
+    // id, not a tab id — passing st.tabId here used to fail silently).
+    const tab = await chrome.tabs.get(st.tabId);
+    await chrome.tabs.update(tab.id, { active: true });
+    if (tab.windowId != null) await chrome.windows.update(tab.windowId, { focused: true });
+  } catch (_) {
+    try {
+      const w = await chrome.windows.getLastFocused();
+      await chrome.windows.update(w.id, { focused: true });
+    } catch (_) { /* popup context — focus is best-effort */ }
+  }
+}
+
+/** Popup "Analyze again": re-open whichever stage errored (or both). */
+/**
+ * Popup "Analyze again": re-open whichever stage errored (or both).
+ * A 'blocked' stage (CAPTCHA) re-opens its URL in the SAME tab when it is
+ * still registered — the user may have already solved the CAPTCHA there, and
+ * re-navigating to the same URL reloads/recognizes the solved session.
+ */
+async function retryAnalyze() {
+  await ensureAnalyzeState();
+  if (!analyzeCache) return;
+  if (analyzeCache.phase === 'fetching-ebay' || analyzeCache.stages.ebay.status === 'error') {
+    if (!analyzeCache.url) return;
+    analyzeCache.phase = 'fetching-ebay';
+    analyzeCache.error = null;
+    const st = analyzeCache.stages.ebay;
+    st.status = 'loading';
+    st.error = null;
+    await commitAnalyze();
+    try {
+      let tab = null;
+      if (st.tabId != null) {
+        try { tab = await chrome.tabs.get(st.tabId); } catch (_) { tab = null; }
+      }
+      if (tab) {
+        // Recovery surface tab still exists: re-navigate it (reuses the
+        // post-CAPTCHA session), re-arm the watchdog, re-register defensively.
+        try { await registerScrapeTab(tab.id); await updateTabSweepAlarm(); } catch (_) { /* noop */ }
+        await chrome.tabs.update(tab.id, { url: analyzeCache.url, active: false });
+        setItemWatch('ebay');
+        await commitAnalyze();
+      } else {
+        st.tabId = null;
+        await openAnalyzeTab('ebay', analyzeCache.url);
+      }
+    } catch (_) { await failAnalyzeStage('ebay', 'parse-failed'); }
+    return;
+  }
+  if (analyzeCache.phase === 'searching-amazon' || analyzeCache.stages.amazon.status === 'error') {
+    if (!(analyzeCache.queryInfo || analyzeCache.manualMatch)) return;
+    analyzeCache.phase = 'searching-amazon';
+    analyzeCache.error = null;
+    const st = analyzeCache.stages.amazon;
+    st.status = 'loading';
+    st.error = null;
+
+    // Rebuild orchestration metadata if a worker restart left a pre-pagination
+    // stage shape, then resume on the CURRENT active (fallback-aware) query.
+    ensureAnalyzeAmazonPlan();
+
+    let url = null;
+    let navQuery = null;
+    if (analyzeCache.manualMatch) {
+      url = analyzeCache.manualMatch.url;
+    } else {
+      navQuery = analyzeCurrentQuery();
+      if (!navQuery) { await failAnalyzeStage('amazon', 'no-results'); return; }
+      // Restart page 1 of the active query with a fresh aggregation — a retry
+      // after a CAPTCHA must not inherit garbage from the interrupted run.
+      st.page = 1;
+      st.pagesDone = 0;
+      st.items = [];
+      url = self.ARBScout.buildAmazonSearchUrl(navQuery, 1);
+    }
+    await commitAnalyze();
+    try {
+      let tab = null;
+      if (st.tabId != null) {
+        try { tab = await chrome.tabs.get(st.tabId); } catch (_) { tab = null; }
+      }
+      if (navQuery) {
+        // Search flow: always go through the pagination-loop navigator so the
+        // watchdog, tab registry and stage.page stay consistent (and a retry
+        // reuses the tab where the CAPTCHA was just solved).
+        st.tabId = tab ? tab.id : null;
+        await navigateAnalyzeAmazonTab(navQuery, 1);
+        console.log('[ARBScout] Amazon tab reopened on retry:', st.tabId);
+      } else if (tab) {
+        // Manual-ASIN flow with a live recovery tab: re-navigate it in place
+        // (reuses the post-CAPTCHA session) and re-arm the watchdog.
+        try { await registerScrapeTab(tab.id); await updateTabSweepAlarm(); } catch (_) { /* noop */ }
+        await chrome.tabs.update(tab.id, { url, active: false });
+        setItemWatch('amazon');
+        await commitAnalyze();
+        console.log('[ARBScout] Amazon product tab reopened on retry:', tab.id);
+      } else {
+        st.tabId = null;
+        await openAnalyzeTab('amazon', url);
+      }
+    } catch (_) { await failAnalyzeStage('amazon', 'parse-failed'); }
+  }
+}
+
+/** Popup cancel / new analyze: drop the run and close its tabs. */
+async function cancelAnalyze() {
+  await ensureAnalyzeState();
+  clearAllItemWatches();
+  if (analyzeCache && analyzeCache.stages) {
+    await closeOwnedTabs([analyzeCache.stages.ebay.tabId, analyzeCache.stages.amazon.tabId]);
+  }
+  analyzeCache = null;
+  try { await chrome.storage.session.remove('arbAnalyzeState'); } catch (_) {}
+  broadcastAnalyze();
+}
+
+/** If the user closes a tab mid-analyze, fail that stage instead of hanging. */
+async function handleAnalyzeTabClosed(tabId) {
+  await ensureAnalyzeState();
+  if (!analyzeCache) return;
+  for (const stage of ['ebay', 'amazon']) {
+    const st = analyzeCache.stages[stage];
+    if (st && st.status === 'loading' && st.tabId === tabId) {
+      await failAnalyzeStage(stage, 'closed');
+    } else if (st && st.status === 'error' && st.error === 'blocked' && st.tabId === tabId) {
+      // The user closed the CAPTCHA tab without solving it — stop claiming
+      // the tab is open and unregister it so the sweep can't fight the user.
+      st.tabId = null;
+      try { await unregisterScrapeTab(tabId); } catch (_) { /* noop */ }
+    }
+  }
+}
+
+/** Load user-saved analyze settings (chrome.storage.local 'arbSettings'). */
+async function loadAnalyzeSettings() {
+  try {
+    const res = await chrome.storage.local.get('arbSettings');
+    const saved = res && res.arbSettings;
+    if (saved && typeof saved === 'object') {
+      return Object.assign({}, DEFAULT_ANALYZE_SETTINGS, saved);
+    }
+  } catch (_) { /* fall through to defaults */ }
+  return Object.assign({}, DEFAULT_ANALYZE_SETTINGS);
 }
 
 /* ------------------------------------------------------------------ *
@@ -698,7 +1896,42 @@ async function handleMessage(msg, sender) {
       return {};
     }
     case 'ARB_RESULTS': {
+      // Two flows share ARB_RESULTS: the legacy keyword run (phase gates in
+      // handleResults ignore analyze runs) and the Phase-2 analyze run.
       await handleResults(msg, sender);
+      await handleAnalyzeAmazonResults(msg, sender);
+      return {};
+    }
+    case 'ARB_ITEM_DATA': {
+      await handleItemData(msg, sender);
+      return {};
+    }
+    case 'ARB_ANALYZE': {
+      const url = String(msg.url || '').trim();
+      const settings = msg.settings && typeof msg.settings === 'object' ? msg.settings : null;
+      await startAnalyze(url, settings ? Object.assign({}, await loadAnalyzeSettings(), settings) : await loadAnalyzeSettings());
+      return {};
+    }
+    case 'ARB_ANALYZE_GET_STATE': {
+      await ensureAnalyzeState();
+      return { state: analyzeCache };
+    }
+    case 'ARB_ANALYZE_RETRY': {
+      await retryAnalyze();
+      return {};
+    }
+    case 'ARB_ANALYZE_CANCEL': {
+      await cancelAnalyze();
+      return {};
+    }
+    case 'ARB_ANALYZE_FOCUS_TAB': {
+      await focusAnalyzeStageTab(msg.stage === 'amazon' ? 'amazon' : 'ebay');
+      return {};
+    }
+    case 'ARB_ANALYZE_MANUAL_MATCH': {
+      const input = String((msg.input || msg.asin || msg.url) || '').trim();
+      if (!input) return { error: 'Missing ASIN or URL' };
+      await applyManualMatch(input);
       return {};
     }
     default:
@@ -713,9 +1946,20 @@ async function handleMessage(msg, sender) {
  * instead of leaving the popup spinner up forever.
  */
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === TAB_SWEEP_ALARM) {
+    sweepOrphanTabs().catch((e) => console.warn('[arb] tab sweep error:', e));
+    return;
+  }
   const m = /^arb\.(r\d+)\.(amazon|ebay)$/.exec(alarm.name);
-  if (!m) return;
-  handleAlarm(m[1], m[2]).catch((e) => console.warn('[arb] alarm error:', e));
+  if (m) {
+    handleAlarm(m[1], m[2]).catch((e) => console.warn('[arb] alarm error:', e));
+    return;
+  }
+  // Phase-2 analyze watchdog failsafe (same pattern, separate namespace).
+  const a = /^arbItem\.(a\d+)\.(ebay|amazon)$/.exec(alarm.name);
+  if (a) {
+    handleItemStageTimeout(a[1], a[2]).catch((e) => console.warn('[arb] item alarm error:', e));
+  }
 });
 
 async function handleAlarm(runId, site) {
@@ -729,17 +1973,42 @@ async function handleAlarm(runId, site) {
 
 
 /** If the user closes the results tab while we wait on it, don't hang. */
-chrome.tabs.onRemoved.addListener((tabId) => {
+chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
   handleTabClosed(tabId).catch((e) => console.warn('[arb] tabs.onRemoved error:', e));
 });
 
 async function handleTabClosed(tabId) {
+  // Always drop closed tabs from the orphan registry, whatever run they
+  // belonged to — otherwise the sweep would keep re-closing dead ids.
+  try { await unregisterScrapeTab(tabId); } catch (_) { /* cleanup.js missing */ }
+
   await ensureState();
-  if (cache.phase !== 'searching') return;
-  for (const site of ['amazon', 'ebay']) {
-    const ss = cache.sites[site];
-    if (ss.status === 'loading' && ss.tabId === tabId) {
-      await failStage(site, 'closed');
+  if (cache.phase === 'searching') {
+    for (const site of ['amazon', 'ebay']) {
+      const ss = cache.sites[site];
+      if (ss.status === 'loading' && ss.tabId === tabId) {
+        await failStage(site, 'closed');
+      }
     }
   }
+  // Phase-2 analyze tabs: fail the stuck stage instead of hanging forever.
+  await handleAnalyzeTabClosed(tabId);
 }
+
+/* ==================================================================== *
+ * Worker (re)start: sweep tabs registered by a previous life            *
+ * ====================================================================
+ * MV3 kills this worker after ~30s idle. If that happened between a tab
+ * being opened and its stage settling, the watchdog timers died with it.
+ * On wake, sweepOrphanTabs() closes every registered tab that is not an
+ * actively-loading stage — so no orphaned scraping tab can survive a
+ * worker restart. */
+(async () => {
+  try {
+    await ensureState();
+    await ensureAnalyzeState();
+    await sweepOrphanTabs();
+  } catch (e) {
+    console.warn('[arb] startup tab sweep failed:', e);
+  }
+})();

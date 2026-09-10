@@ -332,7 +332,7 @@ const KNOWN_BRANDS = [
   'oxo', 'lodge', 'all-clad', 'calphalon', 'pyrex', 'corningware', 'corelle'
 ];
 
-const BRAND_ALIASES = { hp: 'hp', hewlett packard: 'hp', wd: 'western digital', 'be quiet': 'be quiet!', coolermaster: 'cooler master' };
+const BRAND_ALIASES = { hp: 'hp', 'hewlett packard': 'hp', wd: 'western digital', 'be quiet': 'be quiet!', coolermaster: 'cooler master' };
 
 const BRAND_LOOKUP = (() => {
   const map = new Map();

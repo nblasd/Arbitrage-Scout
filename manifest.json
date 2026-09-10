@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "Arbitrage Scout — Amazon ⇄ eBay Comparator",
   "short_name": "Arbitrage Scout",
-  "version": "1.0.0",
-  "description": "Searches the same product on Amazon and eBay, matches similar listings, and estimates resale profit after marketplace fees.",
+  "version": "1.2.0",
+  "description": "Searches the same product on Amazon and eBay, matches similar listings, and estimates resale profit after marketplace fees. Paste an eBay item URL to analyze a single product against Amazon.",
   "minimum_chrome_version": "102",
   "permissions": [
     "storage",
@@ -29,6 +29,14 @@
         "https://www.ebay.com/*"
       ],
       "js": ["content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.ebay.com/itm/*",
+        "https://*.ebay.com/itm/*"
+      ],
+      "js": ["ebay2amazon.js", "content-item.js"],
       "run_at": "document_idle"
     }
   ]

@@ -74,6 +74,115 @@
       display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
       padding: 2px 14px 4px;
     }
+
+    /* ===== Phase 2: analyze flow ===== */
+    .analyze-row { margin-top: 6px; }
+    .analyze-row input {
+      flex: 1; padding: 9px 12px; font-size: 13px;
+      border: 1px solid var(--border); border-radius: 8px; outline: none;
+    }
+    .analyze-row input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(79, 70, 229, .15); }
+    #btnAnalyze {
+      padding: 9px 16px; font-size: 14px; font-weight: 600; color: #fff;
+      background: #0f766e; border: 0; border-radius: 8px; cursor: pointer;
+    }
+    #btnAnalyze:hover { background: #115e59; }
+    #btnAnalyze:disabled { opacity: .55; cursor: default; }
+    .quick-settings { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; margin: 4px 14px; padding: 8px 12px; }
+    .quick-settings label { gap: 6px; }
+    .quick-settings input {
+      width: 62px; padding: 4px 6px; border: 1px solid var(--border);
+      border-radius: 6px; font-size: 13px; text-align: right;
+    }
+
+    .analyze-card {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+      margin: 6px 14px 10px; padding: 12px;
+    }
+    .vs-grid { display: flex; gap: 12px; align-items: stretch; }
+    .vs-grid .side { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+    .vs-mid {
+      flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 6px; min-width: 96px; padding: 0 4px;
+    }
+    .vs-arrow { font-size: 20px; color: var(--muted); }
+    .side-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .side-tag {
+      font-size: 10.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+      color: var(--muted); background: var(--bg); border: 1px solid var(--border);
+      border-radius: 999px; padding: 2px 8px;
+    }
+    .side-link { font-size: 11.5px; font-weight: 600; white-space: nowrap; }
+    .thumb {
+      width: 100%; height: 120px; display: flex; align-items: center; justify-content: center;
+      background: #fff; border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+    }
+    .thumb img { width: 100%; height: 100%; object-fit: contain; display: block; }
+    .thumb .ph { font-size: 30px; font-weight: 700; color: var(--muted); }
+    .side-title { font-size: 12.5px; font-weight: 550; line-height: 1.35; }
+    .side-price { font-size: 15px; font-weight: 700; display: flex; align-items: baseline; gap: 8px; }
+    .side-price .muted { font-size: 12px; font-weight: 500; }
+    .prime {
+      font-size: 10.5px; font-weight: 700; color: #0f766e;
+      border: 1px solid rgba(15, 118, 110, .4); border-radius: 999px; padding: 1px 7px;
+    }
+    .conf {
+      font-size: 12px; font-weight: 700; border-radius: 999px; padding: 3px 10px; white-space: nowrap;
+    }
+    .conf.high { color: #065f46; background: #d1fae5; border: 1px solid #6ee7b7; }
+    .conf.mid  { color: #92400e; background: #fef3c7; border: 1px solid #fcd34d; }
+    .conf.low  { color: #991b1b; background: #fee2e2; border: 1px solid #fca5a5; }
+    .conf.none { color: var(--muted); background: var(--bg); border: 1px solid var(--border); }
+    .profit-box { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px; }
+    .p-metrics { display: flex; gap: 10px; flex-wrap: wrap; }
+    .p-metric {
+      flex: 1; min-width: 110px; background: var(--bg); border: 1px solid var(--border);
+      border-radius: 10px; padding: 8px 12px; display: flex; flex-direction: column; gap: 2px;
+    }
+    .p-label { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+    .p-value { font-size: 17px; font-weight: 750; font-variant-numeric: tabular-nums; }
+    .p-value.pos { color: var(--good); }
+    .p-value.neg { color: var(--bad); }
+    .p-breakdown {
+      margin-top: 10px; font-size: 12px; color: var(--muted);
+      background: var(--bg); border-radius: 8px; padding: 8px 10px;
+      font-variant-numeric: tabular-nums; line-height: 1.6;
+    }
+    .p-warn {
+      margin-top: 8px; font-size: 11.5px; color: #92400e;
+      background: var(--warn-bg); border: 1px solid var(--warn-border); border-radius: 8px; padding: 6px 10px;
+    }
+    /* Phase 3: safety harness badges */
+    .safety-box { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+    .safety-alert {
+      display: flex; gap: 8px; align-items: flex-start;
+      font-size: 11.5px; border-radius: 8px; padding: 6px 10px;
+    }
+    .safety-alert.soft { color: #92400e; background: var(--warn-bg); border: 1px solid var(--warn-border); }
+    .safety-alert.hard { color: #991b1b; background: #fee2e2; border: 1px solid #fca5a5; font-weight: 600; }
+    .safety-alert .icon { flex: 0 0 auto; }
+    .safe-ok {
+      font-size: 11px; color: #065f46; background: #d1fae5; border: 1px solid #6ee7b7;
+      border-radius: 8px; padding: 5px 10px; font-weight: 600;
+    }
+    /* Phase 3: manual match correction */
+    .manual-row { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
+    .manual-row input {
+      flex: 1; padding: 7px 10px; font-size: 12.5px;
+      border: 1px solid var(--border); border-radius: 8px; outline: none;
+    }
+    .manual-row input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(79, 70, 229, .13); }
+    .manual-hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
+    /* Phase 3: export actions */
+    .export-row { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+    .analyze-actions {
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+      margin: 8px 14px 0;
+    }
+    .analyze-actions .hint { color: var(--muted); font-size: 11px; }
+    .ellipsis3 {
+      display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+    }
     .page-limit {
       display: inline-flex; align-items: center; gap: 6px;
       color: var(--muted); font-size: 12.5px; font-weight: 500;
@@ -238,6 +347,106 @@
     <button id="btnCompare">Compare</button>
   </section>
 
+  <!-- ============ Phase 2: eBay-URL → Amazon analyze flow ============ -->
+  <section class="search-row analyze-row">
+    <input id="ebayUrl" type="url" placeholder="Paste an eBay listing URL (https://www.ebay.com/itm/…)" autocomplete="off" spellcheck="false" />
+    <button id="btnAnalyze">Analyze Product</button>
+    <button id="btnQuickSettings" class="ghost" type="button" title="Fee %, sales tax, extra cost buffer">⚙ Settings</button>
+  </section>
+
+  <section id="quickSettings" class="settings-row quick-settings hidden">
+    <label class="page-limit" title="eBay final-value fee + payment fees, % of revenue.">eBay fee %
+      <input id="anEbayFeeRate" type="number" min="0" max="40" step="0.25" value="13.25" />
+    </label>
+    <label class="page-limit" title="Fixed $ fee per order (payment processing).">Fixed fee $
+      <input id="anFixedFee" type="number" min="0" max="5" step="0.05" value="0.30" />
+    </label>
+    <label class="page-limit" title="Estimated state sales tax paid when buying on Amazon.">Sales tax %
+      <input id="anSalesTax" type="number" min="0" max="15" step="0.5" value="7" />
+    </label>
+    <label class="page-limit" title="Optional buffer for miscellaneous costs (labels, packaging, returns…).">Buffer $
+      <input id="anBuffer" type="number" min="0" max="50" step="0.5" value="0" />
+    </label>
+  </section>
+
+  <!-- Analyze progress: step-by-step status -->
+  <section id="analyzeProgress" class="panel hidden">
+    <div class="spinner" aria-hidden="true"></div>
+    <div class="progress-info">
+      <div id="analyzeStep">Fetching eBay listing…</div>
+      <div class="chips">
+        <span class="chip" id="chipStepEbay"><span class="dot"></span><span class="lbl">eBay: waiting</span></span>
+        <span class="chip" id="chipStepAmazon"><span class="dot"></span><span class="lbl">Amazon: waiting</span></span>
+        <span class="chip" id="chipStepProfit"><span class="dot"></span><span class="lbl">Profit: waiting</span></span>
+        <span id="analyzeElapsed" class="sub"></span>
+      </div>
+    </div>
+    <button id="btnAnalyzeRetry" class="ghost hidden">Analyze again</button>
+    <button id="btnAnalyzeCancel" class="ghost hidden">Cancel</button>
+  </section>
+
+  <!-- Analyze error: CAPTCHA/timeout/failure messaging + recovery -->
+  <section id="analyzeError" class="banner hidden"></section>
+
+  <!-- Blocked-stage recovery: the scrape tab stays open as the CAPTCHA surface -->
+  <section id="blockedRecovery" class="banner hidden">
+    <span class="msg" id="blockedRecoveryMsg"></span>
+    <button id="btnFocusBlockedTab" class="ghost" type="button">Open the tab</button>
+    <button id="btnBlockedRetry" class="ghost" type="button">Retry</button>
+  </section>
+
+  <!-- Analyze result: comparison card, confidence badge, profit box -->
+  <section id="analyzeResult" class="hidden">
+    <div class="analyze-card">
+      <div class="vs-grid">
+        <div class="side ebay">
+          <div class="side-head"><span class="side-tag">eBay · SELL</span><a id="anEbayLink" class="side-link" target="_blank" rel="noopener">Open on eBay ↗</a></div>
+          <div class="thumb" id="anEbayThumb"><span class="ph">e</span></div>
+          <div id="anEbayTitle" class="side-title ellipsis3"></div>
+          <div class="side-price"><span id="anEbayPrice">—</span><span id="anEbayShip" class="muted"></span></div>
+        </div>
+        <div class="vs-mid">
+          <span id="anConfidence" class="conf">—</span>
+          <span class="vs-arrow">➜</span>
+          <span id="anStrategy" class="muted"></span>
+        </div>
+        <div class="side amazon">
+          <div class="side-head"><span class="side-tag">Amazon · BUY</span><a id="anAmazonLink" class="side-link" target="_blank" rel="noopener">Open on Amazon ↗</a></div>
+          <div class="thumb" id="anAmazonThumb"><span class="ph">a</span></div>
+          <div id="anAmazonTitle" class="side-title ellipsis3"></div>
+          <div class="side-price"><span id="anAmazonPrice">—</span><span id="anAmazonPrime" class="prime hidden">Prime</span></div>
+        </div>
+      </div>
+      <!-- All candidates scoring >= the 50% floor, ranked below the primary pick -->
+      <div id="anMatches" class="hidden"></div>
+      <div id="anProfitBox" class="profit-box">
+        <div class="p-metrics">
+          <div class="p-metric"><span class="p-label">Net profit</span><span id="anNetProfit" class="p-value">—</span></div>
+          <div class="p-metric"><span class="p-label">ROI</span><span id="anRoi" class="p-value">—</span></div>
+          <div class="p-metric"><span class="p-label">Margin</span><span id="anMargin" class="p-value">—</span></div>
+        </div>
+        <div id="anBreakdown" class="p-breakdown"></div>
+        <div id="anProfitWarn" class="p-warn hidden"></div>
+        <!-- Phase 3: safety harness (variation / quantity alerts) -->
+        <div id="anSafetyBox" class="safety-box"></div>
+        <!-- Phase 3: manual match correction when confidence < 75% -->
+        <div id="anManualMatch" class="hidden">
+          <div class="manual-row">
+            <input id="anAsinInput" type="text" placeholder="Paste the verified Amazon ASIN or product URL…" autocomplete="off" spellcheck="false" />
+            <button id="btnApplyAsin" class="ghost" type="button">Recalculate</button>
+          </div>
+          <div class="manual-hint">Low-confidence match — paste the exact Amazon listing (ASIN like <b>B0XXXXXXXXXX</b> or a /dp/ URL) to recalculate with the item you verified.</div>
+        </div>
+        <!-- Phase 3: export actions -->
+        <div class="export-row">
+          <button id="btnCopyBreakdown" class="ghost" type="button">⧉ Copy Breakdown</button>
+          <button id="btnExportCsv" class="ghost" type="button">⬇ Export CSV</button>
+          <span id="anExportHint" class="hint"></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <section class="settings-row">
     <label class="page-limit" title="Maximum number of search-result pages to scrape on each marketplace. Applies to both eBay and Amazon (1–20).">
       Pages per site
@@ -246,9 +455,18 @@
     </label>
   </section>
 
+  <section class="settings-row">
+    <label class="page-limit" title="How many Amazon search-result pages the Analyze flow crawls per search (1–20).">
+      Amazon pages
+      <input id="amazonPages" type="number" min="1" max="20" step="1" value="3" inputmode="numeric" autocomplete="off" />
+      <span class="hint">per search</span>
+    </label>
+  </section>
+
   <!-- Idle state: shown on popup open until the user clicks Compare. -->
   <p id="readyHint" class="muted hidden">
     Ready. Enter a product to compare its Amazon and eBay prices, then click <b>Compare</b>.
+    Or paste an eBay listing URL and click <b>Analyze Product</b>.
   </p>
 
   <section id="progressBox" class="panel hidden">
@@ -296,6 +514,7 @@
   <footer class="foot">
     <button id="btnOpenEbay" class="link" type="button">Open eBay results</button>
     <button id="btnOpenAmazon" class="link" type="button">Open Amazon results</button>
+    <button id="btnDebugLog" class="link" type="button" title="Copy the background debug log (tab lifecycle events) to the clipboard">Copy Debug Log</button>
     <span>· Estimates only — excludes shipping, returns, taxes &amp; ad costs.</span>
     <button id="btnReset" class="link danger" type="button" title="Clear all stored comparison history and cached data">Reset Data</button>
   </footer>
@@ -303,6 +522,9 @@
   <!-- Toast notification element -->
   <div id="toast" class="hide">Data cleared!</div>
 
+  <script src="profit.js"></script>
+  <script src="safety.js"></script>
+  <script src="export.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

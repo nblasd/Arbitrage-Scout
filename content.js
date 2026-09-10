@@ -53,6 +53,11 @@ const CFG = {
   // Max extra time to wait for Amazon's lazy/client-rendered result grid,
   // once the page looks alive. Increased from 12s to 18s for slower connections.
   gridWaitMs: 18000,
+  // Grace window (ms) for a redirect/interstitial page (sign-in wall, bot
+  // check, error page) to resolve into the real search page before we report
+  // 'no-results-page'. Prevents instant fast-fails when Amazon bounces a
+  // background tab off the requested search URL.
+  redirectWaitMs: 10000,
   // Random pre-parse wait (ms) — mimics a person reading the page first.
   // SKIPPED entirely when the tab is hidden/backgrounded (a background tab
   // would otherwise sit through the full pacing delay before reporting).
@@ -101,6 +106,15 @@ const isSearchPath =
   SITE === 'amazon' ? /^\/(s|gp\/search)(\/|$)/.test(location.pathname)
                     : /^\/sch(\/|$)/.test(location.pathname);
 
+// Phase 3 (manual-match flow): Amazon single-product pages (/dp/<ASIN>,
+// /gp/product/<ASIN>) are valid parse targets. The popup's "paste a verified
+// ASIN/URL" override opens one of these, so we must parse the buybox instead
+// of reporting the page as a non-search redirect.
+const isProductPath =
+  SITE === 'amazon' &&
+  /^\/(dp|gp\/product)\//.test(location.pathname) &&
+  !/\/cart\/|\/checkout\//.test(location.pathname);
+
   function readQueryFromUrl() {
     try {
       const p = new URLSearchParams(location.search);
@@ -109,6 +123,32 @@ const isSearchPath =
     } catch (_) { return ''; }
   }
   const QUERY = readQueryFromUrl();
+  // Page classification trace: the instant-close cause usually shows up right
+  // here (e.g. a redirect landing us on a non-search page, or QUERY empty).
+  console.log('[ARBScout:DBG] PAGE', JSON.stringify({
+    href: String(location.href).slice(0, 160),
+    isSearchPath,
+    isProductPath,
+    query: QUERY || null,
+    readyState: document.readyState,
+  }));
+
+  /**
+   * Page number of the results page currently loaded — Amazon uses ?page=,
+   * eBay uses ?_pgn=. The background orchestrator drives pagination by
+   * navigating the SAME tab, and uses this echo to make sure a reply is for
+   * the page it asked for (a late page-1 payload can never be mistaken for
+   * page-3, and stale duplicate payloads are ignored instead of double-counted).
+   */
+  const PAGE = (() => {
+    try {
+      const sp = new URLSearchParams(location.search);
+      const raw = sp.get('page') || sp.get('_pgn') || '';
+      const n = parseInt(raw, 10);
+      if (Number.isInteger(n) && n > 0) return n;
+    } catch (_) { /* no search params */ }
+    return 1;
+  })();
 
   /* ------------------------------------------------------------------ *
    * Run token — makes every async step interruptible
@@ -214,6 +254,33 @@ function sleepPaced(ms, run) {
     const head = (document.body ? document.body.innerText : '').slice(0, 3000);
     if (/unusual traffic|automated access|security challenge|are you a robot|verify your identity|please complete/i.test(head)) return true;
     return false;
+  }
+
+  /**
+   * Landed on a marketplace URL that is neither a search nor a product page.
+   * This is almost always a REDIRECT from the page the background asked for:
+   * sign-in walls, bot checks and error interstitials all still match
+   * amazon.com/* (or ebay.com/*), so this script runs there too. Do NOT
+   * fast-fail — an instant "no-results-page" is exactly what made the Amazon
+   * tab close 1-2 seconds after opening. Instead: classify known block pages
+   * immediately (that keeps the tab open for recovery), otherwise wait out
+   * one bounded grace window for late server-side redirects to resolve into
+   * the real search page, then report so the background can advance.
+   * Bounded = the run can never hang on a page that will never produce data.
+   */
+  function scheduleRedirectReport() {
+    const run = makeRun();
+    const startedAt = Date.now();
+    const tick = () => {
+      if (!isCurrent(run)) return;
+      if (isBlockedPage()) { report(run, { error: 'blocked' }); return; }
+      if (Date.now() - startedAt >= CFG.redirectWaitMs) {
+        report(run, { error: 'no-results-page' });
+        return;
+      }
+      setTimeout(tick, 500);
+    };
+    setTimeout(tick, 500);
   }
 
   /** Parse a "$1,234.56"-style money string to a number (assumes USD). */
@@ -662,88 +729,146 @@ function sleepPaced(ms, run) {
     return null;
   }
 
-  function amazonPrice(node) {
-    const priceStrategies = [
-      {
-        name: 'offscreen-primary',
-        selectors: [
-          '.a-price .a-offscreen',
+  /**
+   * Parse the buyable price out of a search-result card.
+   *
+   * Contract: NEVER throws and NEVER halts the caller — a missing or
+   * unreadable price degrades the single card, never the page scan (see
+   * parseAmazonNode / extractAmazon). Returns a positive number or null.
+   *
+   * Ordered cascade for modern Amazon search layouts:
+   *   1. Non-strike `.a-price .a-offscreen` variants — the machine-readable,
+   *      visually-hidden price (masked until hydration but present in DOM).
+   *   2. `.a-price-whole` + `.a-price-fraction` split spans (and whole-only).
+   *   3. Hydration data attributes (data-price / data-csa-c-price / …).
+   *   4. Any `.a-offscreen` catch-all.
+   *   5. Strike-through / list prices LAST — not the buy price.
+   *   6. First "$amount" in the card's visible text.
+   * If the card node itself carries no price (some layouts put the price in a
+   * sibling grid column outside the resolved wrapper), the scan escalates ONCE
+   * to the enclosing [data-asin] result card so the neighbor column is covered.
+   */
+  function amazonPrice(node, escalated) {
+    try {
+      if (!node || typeof node.querySelector !== 'function') return null;
+
+      const selectorStrategies = [
+        { name: 'offscreen-nonstrike', sels: [
+          '.a-price:not(.a-text-price) .a-offscreen',
+          'span.a-price span.a-offscreen',
           '.a-price[data-a-color="price"] .a-offscreen',
           '.a-price[data-a-size="xl"] .a-offscreen',
+          '[data-cy="price-recipe"] .a-price .a-offscreen',
           '[data-cy="price-recipe"] .a-offscreen',
-          '.a-text-price .a-offscreen',
           '[data-component-type="s-price"] .a-offscreen',
+          '.s-price .a-offscreen',
           'span[class*="price"] .a-offscreen'
-        ]
-      },
-      {
-        name: 'whole-fraction',
-        fn: (n) => {
-          const whole = n.querySelector('.a-price-whole');
-          if (!whole) return null;
-          const w = parseInt(String(whole.textContent).replace(/[^\d]/g, ''), 10);
-          const priceBlock = whole.closest('.a-price');
-          const fracEl = priceBlock && priceBlock.querySelector('.a-price-fraction');
-          const f = fracEl ? parseInt(String(fracEl.textContent).replace(/[^\d]/g, ''), 10) : 0;
-          if (!Number.isFinite(w)) return null;
-          return w + (Number.isFinite(f) ? f / 100 : 0);
-        }
-      },
-      {
-        name: 'data-attribute',
-        fn: (n) => {
-          // Modern layouts cache the price in hydration data attributes.
-          const el = n.querySelector(
-            '[data-price], [data-a-price], [data-price-whole], [data-csa-c-price], [data-eq-price]'
-          );
-          if (!el) return null;
-          const raw = el.getAttribute('data-price') || el.getAttribute('data-a-price') ||
-                      el.getAttribute('data-price-whole') || el.getAttribute('data-csa-c-price') ||
-                      el.getAttribute('data-eq-price') || '';
-          const m = String(raw).replace(/,/g, '').match(/\d+(?:\.\d{1,2})?/);
-          if (!m) return null;
-          const v = parseFloat(m[0]);
-          return Number.isFinite(v) && v > 0 ? v : null;
-        }
-      },
-      {
-        name: 'any-offscreen',
-        selectors: ['span.a-offscreen']
-      },
-      {
-        name: 'strike-price',
-        selectors: ['.a-price[data-a-strike="true"] .a-offscreen', 'span[data-a-strike="true"] .a-offscreen']
-      },
-      {
-        name: 'a-color-base',
-        selectors: ['.a-color-base.a-text-price', '.a-price.a-text-price']
-      }
-    ];
+        ] },
+        { name: 'any-offscreen', sels: ['span.a-offscreen', '.a-offscreen'] },
+        { name: 'strike-price', sels: [
+          '.a-price[data-a-strike="true"] .a-offscreen',
+          'span[data-a-strike="true"] .a-offscreen'
+        ] },
+        { name: 'list-price', sels: [
+          '.a-text-price .a-offscreen',
+          '.a-color-base.a-text-price',
+          '.a-price.a-text-price .a-offscreen'
+        ] }
+      ];
 
-    for (const strategy of priceStrategies) {
-      if (strategy.selectors) {
-        for (const selector of strategy.selectors) {
+      const fnStrategies = [
+        {
+          name: 'whole-fraction',
+          fn: (n) => {
+            const whole = n.querySelector('.a-price-whole');
+            if (!whole) return null;
+            const priceBlock = whole.closest('.a-price');
+            // A strike-through block shows the LIST price, not the buy price.
+            if (priceBlock && /\ba-text-price\b/.test(priceBlock.className || '')) return null;
+            const w = parseInt(String(whole.textContent).replace(/[^\d]/g, ''), 10);
+            const fracEl = priceBlock && priceBlock.querySelector('.a-price-fraction');
+            const fracStr = fracEl ? String(fracEl.textContent).replace(/[^\d]/g, '') : '';
+            const f = fracStr ? parseInt(fracStr, 10) : 0;
+            if (!Number.isFinite(w) || w <= 0) return null;
+            // A one-digit fraction ("$5.0") renders tenths, not hundredths.
+            const cents = fracStr.length === 1 ? (f * 10) / 100 : f / 100;
+            const v = w + (Number.isFinite(f) ? cents : 0);
+            return Number.isFinite(v) && v > 0 ? v : null;
+          }
+        },
+        {
+          name: 'whole-only',
+          fn: (n) => {
+            const whole = n.querySelector('.a-price-whole');
+            if (!whole) return null;
+            const priceBlock = whole.closest('.a-price');
+            if (priceBlock && /\ba-text-price\b/.test(priceBlock.className || '')) return null;
+            const w = parseInt(String(whole.textContent).replace(/[^\d]/g, ''), 10);
+            return Number.isFinite(w) && w > 0 ? w : null;
+          }
+        },
+        {
+          name: 'data-attribute',
+          fn: (n) => {
+            // Modern layouts cache the price in hydration data attributes.
+            const el = n.querySelector(
+              '[data-price], [data-a-price], [data-price-whole], [data-csa-c-price], [data-eq-price]'
+            );
+            if (!el) return null;
+            const raw = el.getAttribute('data-price') || el.getAttribute('data-a-price') ||
+                        el.getAttribute('data-price-whole') || el.getAttribute('data-csa-c-price') ||
+                        el.getAttribute('data-eq-price') || '';
+            const m = String(raw).replace(/,/g, '').match(/\d+(?:\.\d{1,2})?/);
+            if (!m) return null;
+            const v = parseFloat(m[0]);
+            return Number.isFinite(v) && v > 0 ? v : null;
+          }
+        }
+      ];
+
+      for (const strategy of selectorStrategies) {
+        for (const selector of strategy.sels) {
           const el = node.querySelector(selector);
           if (el) {
+            // Catch-all tiers must not swallow strike-through (list) prices.
+            if (strategy.name === 'any-offscreen' && typeof el.closest === 'function' &&
+                el.closest('.a-text-price, .a-price[data-a-strike="true"]')) continue;
             const p = parseMoney(el.textContent);
             if (p != null) { log(`Price found via ${strategy.name}: ${selector}`); return p; }
           }
         }
-      } else if (strategy.fn) {
+      }
+      for (const strategy of fnStrategies) {
         const p = strategy.fn(node);
         if (p != null) { log(`Price found via ${strategy.name} (fn)`); return p; }
       }
-    }
 
-    // Last resort: first "$amount" in visible text (strip commas, accept ranges).
-    const text = (node.innerText || node.textContent || '').slice(0, 800);
-    const m = text.match(/\$\s?([\d,]+(?:\.\d+)?)/);
-    if (m) { const v = parseFloat(m[1].replace(/,/g, '')); if (Number.isFinite(v) && v > 0) { log('Price found via text regex'); return v; } }
-    warn('No price found in container');
-    return null;
+      // Last resort: first "$amount" in visible text (strip commas, accept ranges).
+      const text = (node.innerText || node.textContent || '').slice(0, 800);
+      const m = text.match(/\$\s?([\d,]+(?:\.\d+)?)/);
+      if (m) { const v = parseFloat(m[1].replace(/,/g, '')); if (Number.isFinite(v) && v > 0) { log('Price found via text regex'); return v; } }
+
+      // Escalate once to the enclosing result card: anchor-fallback wrappers
+      // can resolve to an inner section while the price lives in a sibling
+      // grid column of the same [data-asin] card.
+      if (!escalated && typeof node.closest === 'function') {
+        const card = node.closest('div[data-asin], div[data-component-type="s-search-result"]');
+        if (card && card !== node) {
+          const p = amazonPrice(card, true);
+          if (p != null) { log('Price found via card-container escalation'); return p; }
+        }
+      }
+
+      warn('No price found in container');
+      return null;
+    } catch (e) {
+      // A price failure must never bubble into the parse loop — skip the card.
+      warn('amazonPrice error (card skipped):', e && e.message);
+      return null;
+    }
   }
 
-  function parseAmazonNode(node) {
+  function parseAmazonNode(node, stats) {
     try {
       // Multiple anchor selector strategies
       const anchorSelectors = [
@@ -768,11 +893,11 @@ function sleepPaced(ms, run) {
         anchor = node.querySelector(selector);
         if (anchor) { matchedAnchorSel = selector; break; }
       }
-      if (!anchor) { warn('No anchor found in container'); return null; }
+      if (!anchor) { if (stats) stats.noAnchor++; warn('No anchor found in container'); return null; }
 
       let asin = node.getAttribute && node.getAttribute('data-asin');
       if (!asin) asin = extractAsin(anchor.href);
-      if (!asin || asin.length !== 10) { warn('Invalid ASIN:', asin); return null; }
+      if (!asin || asin.length !== 10) { if (stats) stats.badAsin++; warn('Invalid ASIN:', asin); return null; }
 
       // Title extraction with multiple fallbacks.
       // FIXED: Previously we took the FIRST selector match with >3 chars and
@@ -845,6 +970,7 @@ function sleepPaced(ms, run) {
       if (title.length < 4) {
         // Only reject when we truly have no usable title. Log the candidates
         // for debugging instead of crashing the whole page parse.
+        if (stats) stats.noTitle++;
         warn('Title too short for ASIN', asin, '- candidates:', titleCandidates.map((c) => c.text.slice(0, 40)));
         return null;
       }
@@ -853,7 +979,15 @@ function sleepPaced(ms, run) {
       }
 
       const price = amazonPrice(node);
-      if (price == null) { warn('No valid price for:', title); return null; } // out of stock / unavailable -> not buyable
+      if (price == null) {
+        // Out of stock / unavailable / price not yet hydrated -> the card is
+        // not buyable, but the PAGE SCAN must keep going. Count it and move
+        // on; extractAmazon() retries once when the whole page came back
+        // priceless (Amazon paints titles before it hydrates prices).
+        if (stats) stats.noPrice++;
+        warn('No valid price for:', title);
+        return null;
+      }
 
       // Rating (optional data, kept for future UI use)
       const ratingEl = node.querySelector('span.a-icon-alt');
@@ -869,6 +1003,16 @@ function sleepPaced(ms, run) {
 
       log('Parsed item:', { asin, title: title.slice(0, 50), price, condition });
 
+      // Prime detection (Phase 2 profit math): "Get Fast, Free Shipping with
+      // Amazon Prime" / .prima-badge / delivery blocks all carry it. Absence
+      // of any marker is NOT evidence of non-Prime, so this is best-effort.
+      const primeEl = node.querySelector(
+        '.prima-badge, .s-prime-badge, i.a-icon-prime, [aria-label*="Prime" i], ' +
+        '.s-image[alt*="Prime" i]'
+      );
+      const primeText = /\bprime\b/i.test((node.innerText || '').slice(0, 400));
+      const isPrime = !!(primeEl || primeText);
+
       return {
         id: asin,
         site: 'amazon',
@@ -878,9 +1022,91 @@ function sleepPaced(ms, run) {
         image: amazonImage(node),
         url: `https://www.amazon.com/dp/${asin}`,
         rating: ratingMatch ? parseFloat(ratingMatch[1]) : null,
+        ratingText: ratingTxt || null,
+        isPrime,
         condition
       };
     } catch (e) { warn('parseAmazonNode error:', e.message); return null; }
+  }
+
+  /**
+   * Phase 3 (manual-match flow): extract a single Amazon product page.
+   * The popup's ASIN/URL override opens /dp/<ASIN> and we need its real
+   * buybox price — search-grid selectors don't exist on product pages. Any
+   * missing core field (title, price) returns null and reports 'no-title',
+   * which background.js already translates into a region/availability error.
+   */
+  function parseAmazonProductPage() {
+    try {
+      const asin = (location.pathname.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})(?:\/|$)/i) || [])[1];
+      if (!asin) { warn('Product page has no ASIN:', location.pathname); return null; }
+
+      const titleEl = document.querySelector('#productTitle, h1#title, .product-title-word-break, #itemTitle');
+      const title = titleEl
+        ? titleEl.textContent.replace(/\s+/g, ' ').trim()
+        : '';
+      if (title.length < 4) { warn('Product page title missing:', asin); return null; }
+
+      // Buybox price selectors (in descending order of specificity). The
+      // .a-offscreen value is masked-but-machine-readable; #price_inside_buybox
+      // is the legacy fallback; the generic buybox scan is last resort.
+      const priceSelectors = [
+        '#corePrice_feature_div .a-price .a-offscreen',
+        '#corePriceDisplay_desktop_feature_div .a-price .a-offscreen',
+        '#apex_desktop .a-price .a-offscreen',
+        '#apex_desktop_newAccordionRow .a-price .a-offscreen',
+        '.priceToPay .a-offscreen',
+        'span.a-price[data-a-size="xl"] .a-offscreen',
+        '#price_inside_buybox',
+        '#outOfStock .a-price .a-offscreen'
+      ];
+      let price = null;
+      for (const sel of priceSelectors) {
+        const el = document.querySelector(sel);
+        if (!el) continue;
+        const p = parseMoney(el.textContent);
+        if (p != null) { price = p; break; }
+      }
+      if (price == null) {
+        // Last resort: the first "$amount" anywhere in the buybox column.
+        const box = document.querySelector('#buybox, #desktop_buybox, #centerCol') || document.body;
+        const m = (box.innerText || '').match(/\$\s?([\d,]+(?:\.\d+)?)/);
+        if (m) {
+          const v = parseFloat(m[1].replace(/,/g, ''));
+          if (Number.isFinite(v) && v > 0) price = v;
+        }
+      }
+      if (price == null) { warn('Product page price missing:', asin); return null; }
+
+      // Prime / free shipping: the delivery block ("FREE delivery … with
+      // Amazon Prime"). Rarely a checkbox, always text — best effort, same
+      // semantics as the search-card prime detection.
+      const bodyText = (document.body ? document.body.innerText || '' : '');
+      const primeArea = (bodyText.slice(0, 4000) || '').toLowerCase();
+      const isPrime = /\bprime\b/i.test(primeArea) && /free shipping|free delivery/i.test(primeArea);
+
+      const ratingEl = document.querySelector('#acrPopover, #acrPopoverLink, span.a-icon-alt, [data-hook="rating-out-of-text"]');
+      const ratingTxt = ratingEl ? ratingEl.textContent.trim() : '';
+      const ratingMatch = ratingTxt.match(/(\d+(?:\.\d+)?)\s*out of 5/);
+
+      const img = document.querySelector('#landingImage, #imgBlkFront, img[data-a-dynamic-image], img[src*="images/I/"]');
+      const rawImg = (img && (img.currentSrc || img.src)) || '';
+      const image = /^https?:\/\//.test(rawImg) && !/\/images\/G\/01\//.test(rawImg) ? rawImg : null;
+
+      return {
+        id: asin,
+        site: 'amazon',
+        title,
+        price,
+        priceText: `$${price.toFixed(2)}`,
+        image,
+        url: `https://www.amazon.com/dp/${asin}`,
+        rating: ratingMatch ? parseFloat(ratingMatch[1]) : null,
+        ratingText: ratingTxt || null,
+        isPrime,
+        condition: /used|refurbished|renewed/i.test(bodyText.slice(0, 2000)) ? 'Used' : 'New'
+      };
+    } catch (e) { warn('parseAmazonProductPage error:', e.message); return null; }
   }
 
   /**
@@ -908,16 +1134,40 @@ function sleepPaced(ms, run) {
     // Return to the top so pagination starts from a clean scroll position.
     window.scrollTo({ top: 0, behavior: 'instant' });
 
-    const items = [];
-    const seen = new Set();
-    for (const node of containers) {
-      const it = parseAmazonNode(node);
-      if (!it || seen.has(it.id)) continue;
-      seen.add(it.id);
-      items.push(it);
-      if (items.length >= CFG.maxItems.amazon) break;
+    const stats = { scanned: 0, noAnchor: 0, badAsin: 0, noTitle: 0, noPrice: 0 };
+    const parseAll = () => {
+      const items = [];
+      const seen = new Set();
+      for (const node of containers) {
+        stats.scanned++;
+        const it = parseAmazonNode(node, stats);
+        if (!it || seen.has(it.id)) continue;
+        seen.add(it.id);
+        items.push(it);
+        if (items.length >= CFG.maxItems.amazon) break;
+      }
+      return items;
+    };
+
+    let items = parseAll();
+
+    // Price hydration retry: Amazon frequently renders titles/links first and
+    // fills in the masked prices a beat later. If the grid clearly rendered
+    // organic cards but NONE carried a parsable price, give hydration ONE
+    // bounded retry instead of reporting a dead page (which used to cascade
+    // into 'parse-failed' -> stage failure -> premature tab close).
+    if (!items.length && stats.noPrice > 0) {
+      log(`Grid has cards but 0 priced items (${stats.noPrice} skipped) — retrying once after hydration wait...`);
+      await sleepPaced(1200, run);
+      if (!isCurrent(run)) return { items: [], stats };
+      stats.scanned = 0; stats.noAnchor = 0; stats.badAsin = 0; stats.noTitle = 0; stats.noPrice = 0;
+      items = parseAll();
     }
-    return items;
+
+    if (stats.noPrice > 0) {
+      warn(`${stats.noPrice}/${stats.scanned} cards skipped: no parsable price (page scan continues with the rest)`);
+    }
+    return { items, stats };
   }
 
 /* ------------------------------------------------------------------ *
@@ -1406,6 +1656,7 @@ function sleepPaced(ms, run) {
       runId: run.id,
       site: SITE,
       query: QUERY,
+      page: PAGE,
       url: location.href,
       title: document.title,
       items: [],
@@ -1424,6 +1675,20 @@ function sleepPaced(ms, run) {
 
     const work = (async () => {
       if (isBlockedPage()) { report(run, { error: 'blocked' }); return; }
+
+      // Phase 3: Amazon single-product pages (manual-match ASIN/URL override)
+      // skip the search-grid machinery entirely — parse the buybox directly.
+      if (SITE === 'amazon' && isProductPath) {
+        const item = parseAmazonProductPage();
+        if (!isCurrent(run)) return;
+        if (item) {
+          log('Parsed product page:', { asin: item.id, title: item.title.slice(0, 50), price: item.price });
+          report(run, { items: [item] });
+        } else {
+          report(run, { error: 'no-title' });
+        }
+        return;
+      }
 
       if (!document.hidden) {
         await humanPause(run, CFG.preParseMinMs, CFG.preParseMaxMs);
@@ -1462,8 +1727,15 @@ function sleepPaced(ms, run) {
       if (isBlockedPage()) { report(run, { error: 'blocked' }); return; }
 
       let items = [];
+      let priceStats = null;
       try {
-        items = SITE === 'amazon' ? await extractAmazon(run) : extractEbay();
+        const extraction = SITE === 'amazon' ? await extractAmazon(run) : null;
+        if (extraction) {
+          items = extraction.items;
+          priceStats = extraction.stats;
+        } else {
+          items = extractEbay();
+        }
       } catch (e) {
         warn('Extraction error:', e.message);
         report(run, { error: 'parse-failed' });
@@ -1473,7 +1745,13 @@ function sleepPaced(ms, run) {
       if (!items.length) {
         if (SITE === 'amazon') {
           const hasProductLinks = document.querySelectorAll('a[href*="/dp/"], a[href*="/gp/product/"]').length > 0;
-          if (hasProductLinks) {
+          if (priceStats && priceStats.noPrice > 0 && hasProductLinks) {
+            // Cards rendered with titles/links but no parsable price — a
+            // DISTINCT, recoverable reason. background.js keeps the tab open
+            // and retries / falls back instead of treating the stage as dead
+            // and calling chrome.tabs.remove() on it.
+            report(run, { error: 'price-parse', skippedForPrice: priceStats.noPrice });
+          } else if (hasProductLinks) {
             report(run, { error: 'parse-failed' });
           } else {
             report(run, { error: 'no-results' });
@@ -1521,8 +1799,22 @@ function sleepPaced(ms, run) {
     return false;
   });
 
-  if (!isSearchPath) {
-    report(makeRun(), { error: 'no-results-page' });
+  if (!isSearchPath && !isProductPath) {
+    // Never fast-fail a redirect: classify + grace-wait first (see
+    // scheduleRedirectReport). This gate used to report 'no-results-page'
+    // instantly, burning the whole fallback query plan in ~1-2s and closing
+    // the Amazon tab before any real page could load.
+    scheduleRedirectReport();
+    return;
+  }
+
+  // Phase 3: product pages carry no ?k= search query — run the buybox parse.
+  if (isProductPath) {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', () => runScrape({ force: false }));
+    } else {
+      runScrape({ force: false });
+    }
     return;
   }
 
