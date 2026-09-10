@@ -1254,6 +1254,7 @@ async function handleAnalyzeAmazonResults(msg, sender) {
   }
 
   // Candidate cap reached — no point crawling more pages.
+  const pagesPer = analyzeAmazonPagesPerSite();
   if ((st.items || []).length >= ANALYZE_MAX_AMAZON_ITEMS) {
     console.log(`[ARBScout] Reached candidate cap ${ANALYZE_MAX_AMAZON_ITEMS} — enough candidates collected; finishing early (tab closes by design, match continues)`);
     await settleAnalyzeAmazonStage('candidate cap reached');
@@ -1264,7 +1265,6 @@ async function handleAnalyzeAmazonResults(msg, sender) {
   console.log(`[ARBScout] Progress: ${(st.items || []).length}/${ANALYZE_MAX_AMAZON_ITEMS} items collected, continuing to page ${msgPage + 1}/${pagesPer}`);
 
   // Last requested page consumed — settle (pagination window over).
-  const pagesPer = analyzeAmazonPagesPerSite();
   console.log(`[ARBScout] Page check: msgPage=${msgPage}, pagesPer=${pagesPer}, condition=${msgPage >= pagesPer}`);
   if (msgPage >= pagesPer) {
     console.log(`[ARBScout] Amazon page ${msgPage}/${pagesPer} parsed — pagination complete`);
@@ -1284,7 +1284,6 @@ async function handleAnalyzeAmazonResults(msg, sender) {
   }
   console.log(`[ARBScout] Crawling Amazon page ${msgPage + 1}/${pagesPer} of query "${String(activeQuery).slice(0, 40)}"`);
   await navigateAnalyzeAmazonTab(activeQuery, msgPage + 1);
-}
 
 /**
  * React to a per-page error from the Amazon tab. 'blocked' / 'timeout' fail
