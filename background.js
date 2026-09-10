@@ -532,11 +532,16 @@ async function continueAmazonPagination() {
     userLimit
   );
   const nextPage = (ss.page || 1) + 1;
+  
+  // DEBUG: Log pagination decision
+  console.log(`[arb] [DEBUG] continueAmazonPagination: page=${ss.page}, nextPage=${nextPage}, amazonMaxPages=${amazonMaxPages}, userLimit=${userLimit}, ss.maxPage=${ss.maxPage}`);
+  
   // A successful page payload re-arms the one-shot price-parse retry so a
   // later page's hydration hiccup still gets its own bounded retry.
   ss.priceParseRetried = false;
   ss.noResultsRetried = false; // same for the paced no-results retry
   if (nextPage <= amazonMaxPages) {
+    console.log(`[arb] [DEBUG] Continuing to Amazon page ${nextPage}`);
     // Rate-limit handling: add a random human-like delay between Amazon page
     // navigations to avoid triggering bot detection.
     const delayMs = AMAZON_PAGE_DELAY_MIN_MS +
@@ -546,6 +551,7 @@ async function continueAmazonPagination() {
     return;
   }
 
+  console.log(`[arb] [DEBUG] Stopping Amazon pagination at page ${ss.page} (nextPage=${nextPage} > amazonMaxPages=${amazonMaxPages})`);
   ss.status = 'done';
   await commit();
   await retireSearchStageTab('amazon'); // Amazon capture complete: reclaim its tab
@@ -652,6 +658,13 @@ async function handleResults(msg, sender) {
 
   ss.items = dedupeItems([...(ss.items || []), ...(Array.isArray(msg.items) ? msg.items : [])]);
   ss.pagesDone = Math.max(ss.pagesDone || 0, ss.page || 1);
+  // DEBUG: Log maxPage received from content script
+  if (Number.isInteger(msg.maxPage)) {
+    ss.maxPage = msg.maxPage;
+    console.log(`[arb] [DEBUG] Amazon page ${ss.page}: received maxPage=${msg.maxPage} from content script`);
+  } else {
+    console.log(`[arb] [DEBUG] Amazon page ${ss.page}: NO maxPage from content script (msg.maxPage=${msg.maxPage})`);
+  }
   await commit();
   await continueAmazonPagination();
 }
