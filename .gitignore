@@ -1,3 +1,1 @@
-```
-*.bak
-```
+Nothing should be ignored since only a source file (`background.js`) was modified and no build artifacts, dependencies, or temporary files were present in the changes.
