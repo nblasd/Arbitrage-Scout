@@ -105,23 +105,25 @@
     fetchTimeoutMs: 20000,
     // DOM wait for eBay's client-side title render (eBay injects it late).
     domReadyTimeoutMs: 8000,
-    // Match pipeline tunables.
-    minConfidence: 0.5,     // FINAL acceptance floor (0..1) -> 50%
-    matchListFloor: 0.5,    // every scored candidate at/above this goes into matches[]
+    // Match pipeline tunables - IMPROVED for higher match rates.
+    minConfidence: 0.45,     // FINAL acceptance floor lowered from 50% to 45%
+    matchListFloor: 0.35,    // Show more candidates in list, lowered from 50% to 35%
     // Reduced floor applied ONLY when the model identifier AND brand (or a
     // GTIN) both lock — the most reliable signal in e-commerce matching.
     // Real Amazon search titles are keyword-stuffed (200+ chars of fitment
     // lists), which dilutes token similarity and lands genuine same-product
     // pairs just under the generic floor; the identifier lock de-risks them.
-    identifierFloor: 0.5,
-    candidateSimThreshold: 0.18, // quick pre-filter before full scoring
-    maxCandidates: 10,      // "top 5–10 Amazon results" per the task
+    identifierFloor: 0.40,   // Lowered from 50% to 40%
+    candidateSimThreshold: 0.15, // quick pre-filter before full scoring (lowered from 0.18)
+    maxCandidates: 15,       // Increased from 10 to consider more candidates
     // Identifier queries: eBay title text is ignored for matching, but keep a
     // low-title fallback score so a GTIN hit with an odd Amazon title still wins.
     identifierQueryTokenFallback: 0.15,
     // Unit-cost bonus (cents): reward candidates whose per-unit price is closest.
     // Keeps "1x $9.99" above "12x $89.99" when everything else ties.
-    unitPriceBonusMax: 0.03
+    unitPriceBonusMax: 0.05, // Increased from 0.03
+    // Price preference: bonus for Amazon items priced LOWER than eBay
+    pricePreferenceBonus: 0.08 // New: 8% bonus if Amazon price is lower
   };
 
   /* ==================================================================== *
@@ -779,6 +781,13 @@
   function extractBrandFromText(text) {
     const t = foldKey(text);
     if (!t) return null;
+    
+    // Check for generic/unbranded keywords first - these should NOT be treated as real brands
+    const genericBrands = ['unbranded', 'generic', 'oem', 'aftermarket', 'no brand', 'nobrand'];
+    for (const gb of genericBrands) {
+      if (t.includes(gb)) return null; // Return null instead of treating as a brand
+    }
+    
     let best = null, bestLen = 0;
     for (const b of BRAND_LOOKUP.keys()) {
       if (b.length <= bestLen) continue;
@@ -1306,7 +1315,8 @@
     }
 
     /* --- Weighted blend (available signals renormalize) --- */
-    const WEIGHTS = { identifier: 0.35, title: 0.30, brand: 0.15, category: 0.12, bundle: 0.08 };
+    // Rebalanced weights: heavier on title/semantic, lighter on strict identifiers
+    const WEIGHTS = { identifier: 0.20, title: 0.40, brand: 0.12, category: 0.15, bundle: 0.13 };
     let acc = 0, wsum = 0;
     for (const [k, w] of Object.entries(WEIGHTS)) {
       const v = signals[k];
@@ -1318,9 +1328,19 @@
 
     /* --- Hard penalties --- */
     if (bundleVerdict === 'mismatch') score -= 0.45;      // single vs 12-pack
-    if (signals.brand === 0 && signals.identifier === 0) score -= 0.25;
-    else if (signals.brand === 0) score -= 0.15;
+    // Relaxed brand penalty: only penalize if BOTH brand AND identifier conflict
+    if (signals.brand === 0 && signals.identifier === 0) score -= 0.20;
+    else if (signals.brand === 0 && q.brand && q.brand.toLowerCase() !== 'unbranded' && q.brand.toLowerCase() !== 'generic') score -= 0.10;
+    
     score += unitPriceBonus;
+    
+    // NEW: Price preference bonus - reward Amazon items priced LOWER than eBay
+    if (Number.isFinite(ebayProduct.totalPrice) && Number.isFinite(amazonItem.price) &&
+        amazonItem.price > 0 && ebayProduct.totalPrice > 0) {
+      if (amazonItem.price < ebayProduct.totalPrice) {
+        score += CFG.pricePreferenceBonus; // 8% bonus for lower Amazon price
+      }
+    }
 
     // Identifier double-lock bonus: model AND brand both confirmed => the
     // single most reliable signal in e-commerce matching.
