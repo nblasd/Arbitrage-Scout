@@ -170,6 +170,7 @@ function render() {
 
   if (searching) {
     const amz = state.sites.amazon;
+    const ali = state.sites.aliexpress;
     const ebay = state.sites.ebay;
     const elapsed = Math.min(99, Math.floor((Date.now() - (state.startedAt || Date.now())) / 1000));
     const pageLimit = Number.isInteger(state.pageLimit) && state.pageLimit > 0 ? state.pageLimit : 3;
@@ -177,9 +178,11 @@ function render() {
     if (ebay.status === 'loading') {
       const page = ebay.page || 1;
       step = `Step 1 of 2 — searching eBay page ${page} of ${pageLimit}…`;
-    } else if ((ebay.status === 'done' || ebay.status === 'error') && amz.status === 'loading') {
-      const page = amz.page || 1;
-      step = `Step 2 of 2 — searching Amazon page ${page} of ${pageLimit} & comparing…`;
+    } else if ((ebay.status === 'done' || ebay.status === 'error') && (amz.status === 'loading' || ali.status === 'loading')) {
+      const pages = [];
+      if (amz.status === 'loading') pages.push(`Amazon page ${amz.page || 1} of ${pageLimit}`);
+      if (ali.status === 'loading') pages.push(`AliExpress page ${ali.page || 1} of ${pageLimit}`);
+      step = `Step 2 of 2 — searching ${pages.join(' & ')} & comparing…`;
     } else {
       step = 'Comparing results…';
     }

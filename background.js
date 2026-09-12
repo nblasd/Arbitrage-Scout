@@ -1294,7 +1294,19 @@ async function analyzeBuildQueryAndSearch() {
   // Initialize AliExpress stage as well
   const aliSt = analyzeCache.stages.aliexpress;
   if (aliSt) {
-    aliSt.query = exactTitleQuery(item.title); // Use the exact title query for AliExpress
+    // For AliExpress, always use a title-based query (not GTIN which Amazon prefers)
+    // Build a keyword-based query from the title for better AliExpress results
+    try {
+      const amazonQueryInfo = self.ARBScout.cleanTitleAndBuildQuery(item.title, item.specifics || {});
+      // If Amazon used GTIN, we override with title-based keywords for AliExpress
+      if (amazonQueryInfo.strategy === 'gtin') {
+        aliSt.query = exactTitleQuery(item.title);
+      } else {
+        aliSt.query = amazonQueryInfo.query;
+      }
+    } catch (e) {
+      aliSt.query = exactTitleQuery(item.title);
+    }
     aliSt.page = 1;
     aliSt.pagesDone = 0;
     aliSt.items = [];
