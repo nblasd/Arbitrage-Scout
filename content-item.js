@@ -16,9 +16,6 @@
  * selector logic — this file only handles the content-script environment:
  * run tokens, bounded waits, blocked-page reporting, and the message channel.
  *
- * Reuse of the extractor also keeps test coverage honest: the same
- * extractFromDocument code is exercised by test_phase1.js in Node.
- *
  * Anti-hang design mirrors content.js:
  *   - every async step checks a run token and bails when superseded,
  *   - the whole parse is raced against a wall-clock deadline,

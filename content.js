@@ -97,14 +97,18 @@ const SITE = HOST === 'amazon.com' || HOST.endsWith('.amazon.com')
   ? 'amazon'
   : HOST === 'ebay.com' || HOST.endsWith('.ebay.com')
     ? 'ebay'
-    : null;
+    : HOST === 'aliexpress.com' || HOST.endsWith('.aliexpress.com')
+      ? 'aliexpress'
+      : null;
 
 // Not one of the supported marketplaces -> do nothing.
 if (!SITE) return;
 
 const isSearchPath =
   SITE === 'amazon' ? /^\/(s|gp\/search)(\/|$)/.test(location.pathname)
-                    : /^\/sch(\/|$)/.test(location.pathname);
+  : SITE === 'ebay' ? /^\/sch(\/|$)/.test(location.pathname)
+  : SITE === 'aliexpress' ? /^\/wholesale/.test(location.pathname)
+  : false;
 
 // Phase 3 (manual-match flow): Amazon single-product pages (/dp/<ASIN>,
 // /gp/product/<ASIN>) are valid parse targets. The popup's "paste a verified
@@ -119,7 +123,9 @@ const isProductPath =
     try {
       const p = new URLSearchParams(location.search);
       return SITE === 'amazon' ? (p.get('k') || '').trim()
-                               : (p.get('_nkw') || '').trim();
+             : SITE === 'ebay' ? (p.get('_nkw') || '').trim()
+             : SITE === 'aliexpress' ? (p.get('SearchText') || '').trim()
+             : '';
     } catch (_) { return ''; }
   }
   const QUERY = readQueryFromUrl();
@@ -1675,43 +1681,40 @@ function sleepPaced(ms, run) {
       const numbers = new Set();
       let sawNext = false;
 
-      // DEBUG: Log what we're finding
-      log('[DEBUG amazonMaxPage] Starting detection...');
-      
       // 1) Primary: Amazon's pagination container
       const paginationContainer = document.querySelector('.s-pagination-container');
-      log('[DEBUG amazonMaxPage] paginationContainer found:', !!paginationContainer);
+      
       
       if (paginationContainer) {
         // Get all page number links
         const pageLinks = paginationContainer.querySelectorAll('a[href*="page="], a[href*="ref=sr_pg_"]');
-        log('[DEBUG amazonMaxPage] pageLinks count:', pageLinks.length);
+        
         
         for (const link of pageLinks) {
           const text = (link.textContent || '').replace(/\s+/g, ' ').trim();
           const asNum = parseInt(text, 10);
           if (Number.isInteger(asNum) && asNum > 0 && asNum <= 500) {
             numbers.add(asNum);
-            log('[DEBUG amazonMaxPage] Found page number:', asNum);
+            
           }
           // Check for next button
           if (/next|siguiente|suivant|weiter|prossimo|avançar/i.test(text) || 
               /next|siguiente|suivant|weiter|prossimo|avançar/i.test(link.getAttribute('aria-label') || '')) {
             sawNext = true;
-            log('[DEBUG amazonMaxPage] Found Next button via link text');
+            
           }
         }
 
         // Also check for span/page elements with numbers
         const pageElements = paginationContainer.querySelectorAll('span, div, li');
-        log('[DEBUG amazonMaxPage] pageElements count:', pageElements.length);
+        
         
         for (const el of pageElements) {
           const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
           const asNum = parseInt(text, 10);
           if (Number.isInteger(asNum) && asNum > 0 && asNum <= 500) {
             numbers.add(asNum);
-            log('[DEBUG amazonMaxPage] Found page number from element:', asNum);
+            
           }
         }
       }
@@ -1719,7 +1722,7 @@ function sleepPaced(ms, run) {
       // 2) Fallback: scan all links with page parameter
       if (numbers.size === 0) {
         const links = document.querySelectorAll('a[href*="page="]');
-        log('[DEBUG amazonMaxPage] Fallback: scanning all page= links, count:', links.length);
+        
         
         for (const link of links) {
           const href = link.getAttribute('href') || '';
@@ -1728,7 +1731,7 @@ function sleepPaced(ms, run) {
             const asNum = parseInt(match[1], 10);
             if (Number.isInteger(asNum) && asNum > 0 && asNum <= 500) {
               numbers.add(asNum);
-              log('[DEBUG amazonMaxPage] Found page from href:', asNum);
+              
             }
           }
         }
@@ -1741,16 +1744,14 @@ function sleepPaced(ms, run) {
         );
         if (nextButton) {
           sawNext = true;
-          log('[DEBUG amazonMaxPage] Found Next button via selector');
+          
         }
       }
-
-      log('[DEBUG amazonMaxPage] numbers set:', [...numbers], 'sawNext:', sawNext);
 
       if (numbers.size) {
         const max = Math.max(...numbers);
         const result = sawNext ? Math.max(max, max + 1) : max;
-        log('[DEBUG amazonMaxPage] Returning maxPage:', result);
+        
         return result;
       }
 
@@ -1760,18 +1761,18 @@ function sleepPaced(ms, run) {
         const currentPage = parseInt(currentPageMatch[1], 10);
         // If we're on a page and there are results, assume at least this many pages exist
         const resultItems = document.querySelectorAll('[data-asin]');
-        log('[DEBUG amazonMaxPage] Current page from URL:', currentPage, 'resultItems:', resultItems.length);
+        
         
         if (resultItems.length > 0) {
-          log('[DEBUG amazonMaxPage] Returning current page as maxPage:', currentPage);
+          
           return currentPage;
         }
       }
 
-      log('[DEBUG amazonMaxPage] Amazon pagination element not found - maxPage unknown');
+      
       return null;
     } catch (e) {
-      warn('[DEBUG amazonMaxPage] error:', e.message);
+      warn('amazonMaxPage error:', e.message);
       return null;
     }
   }
@@ -1787,6 +1788,218 @@ function sleepPaced(ms, run) {
       if (items.length >= CFG.maxItems.ebay) break;
     }
     return items;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * ALIEXPRESS extraction
+   * ------------------------------------------------------------------ */
+  function aliexpressContainers() {
+    const byId = new Map();
+    let totalFound = 0;
+
+    // Strategy A: main product card selectors
+    const cardSelectors = [
+      '.list-item',
+      '.recommend-card',
+      'div[class*="card"]',
+      '.srp-product-list-item',
+      '[data-track-role="item"]'
+    ];
+    for (const sel of cardSelectors) {
+      try {
+        const nodes = Array.from(document.querySelectorAll(sel));
+        if (nodes.length > 0) {
+          log(`AliExpress selector "${sel}" matched ${nodes.length} nodes`);
+          totalFound += nodes.length;
+          for (const n of nodes) {
+            const id = n.getAttribute('data-id') || n.getAttribute('data-spm') || null;
+            if (id && !byId.has(id)) {
+              // Verify it has a link to a product
+              if (n.querySelector('a[href*="/item/"], a[href*="/i/"]')) {
+                byId.set(id, n);
+              }
+            }
+          }
+        }
+      } catch (_) { /* ignore */ }
+    }
+
+    if (byId.size >= 2) {
+      log(`Total unique AliExpress items found: ${byId.size} (from ${totalFound} raw matches)`);
+      return Array.from(byId.values());
+    }
+
+    // Strategy B: fallback – generic list items with product links
+    const fallbackSelectors = [
+      'li[class*="item"]',
+      'div[class*="product"]',
+      '.product-item'
+    ];
+    for (const sel of fallbackSelectors) {
+      try {
+        const nodes = Array.from(document.querySelectorAll(sel));
+        if (nodes.length > 0) {
+          log(`AliExpress fallback selector "${sel}" matched ${nodes.length} nodes`);
+          for (const n of nodes) {
+            const anchor = n.querySelector('a[href*="/item/"], a[href*="/i/"]');
+            if (!anchor) continue;
+            const match = anchor.href.match(/\/item\/(\d+)\.html|\/i\/(\d+)\.html/);
+            const id = match ? (match[1] || match[2]) : null;
+            if (id && !byId.has(id)) {
+              byId.set(id, n);
+            }
+          }
+        }
+      } catch (_) { /* ignore */ }
+    }
+
+    if (byId.size >= 2) {
+      log(`AliExpress fallback found ${byId.size} unique items`);
+      return Array.from(byId.values());
+    }
+
+    // Strategy C: last-resort – any container with an /item/ link
+    log('Attempting AliExpress anchor-based fallback...');
+    document.querySelectorAll('a[href*="/item/"], a[href*="/i/"]').forEach((a) => {
+      const match = a.href.match(/\/item\/(\d+)\.html|\/i\/(\d+)\.html/);
+      if (!match) return;
+      const id = match[1] || match[2];
+      if (!id || byId.has(id)) return;
+      // Find the closest reasonable container
+      const container = a.closest('li, div[class*="card"], div[class*="item"], article, [data-track-role]') || a.parentElement;
+      if (container) {
+        byId.set(id, container);
+      }
+    });
+
+    if (byId.size > 0) {
+      log(`AliExpress anchor fallback found ${byId.size} items`);
+      return Array.from(byId.values());
+    }
+
+    return [];
+  }
+
+  function parseAliExpressNode(node) {
+    try {
+      const anchor = node.querySelector('a[href*="/item/"], a[href*="/i/"]');
+      if (!anchor) return null;
+
+      const href = anchor.href;
+      const match = href.match(/\/item\/(\d+)\.html|\/i\/(\d+)\.html/);
+      const id = match ? (match[1] || match[2]) : null;
+      if (!id) return null;
+
+      // Title extraction
+      const titleEl = node.querySelector('.item-title, .product-title, [class*="title"]');
+      const title = titleEl ? titleEl.textContent.trim() : anchor.textContent.trim();
+      if (!title) return null;
+
+      // Price extraction
+      const priceEl = node.querySelector('.sale-price, .current-price, [class*="price"]');
+      let price = null;
+      if (priceEl) {
+        const rawPrice = priceEl.textContent.trim();
+        const priceMatch = rawPrice.match(/[\d,]+\.?\d*/);
+        if (priceMatch) {
+          price = parseFloat(priceMatch[0].replace(/,/g, ''));
+        }
+      }
+
+      // Image extraction
+      const imgEl = node.querySelector('img[src]');
+      const imageUrl = imgEl ? (imgEl.src || imgEl.dataset-src || '') : '';
+
+      return {
+        id: `ae_${id}`,
+        title,
+        price,
+        imageUrl,
+        link: href,
+        source: 'aliexpress'
+      };
+    } catch (e) {
+      warn('Error parsing AliExpress node:', e.message);
+      return null;
+    }
+  }
+
+  function extractAliExpress() {
+    const items = [];
+    const seen = new Set();
+    for (const node of aliexpressContainers()) {
+      const it = parseAliExpressNode(node);
+      if (!it || seen.has(it.id)) continue;
+      seen.add(it.id);
+      items.push(it);
+      // Use same limit as eBay for consistency
+      if (items.length >= CFG.maxItems.ebay) break;
+    }
+    return items;
+  }
+
+  /**
+   * Detect the total number of available pages from AliExpress pagination.
+   */
+  function aliexpressMaxPage() {
+    try {
+      const numbers = new Set();
+      let sawNext = false;
+
+      // Primary: pagination elements
+      const pagerSelectors = [
+        '.ui-pagination-navi li',
+        '.pagination li',
+        '[class*="pagination"] li',
+        '.ui-pagination-navi a',
+        '.pagination a'
+      ];
+
+      for (const sel of pagerSelectors) {
+        try {
+          const els = Array.from(document.querySelectorAll(sel));
+          for (const el of els) {
+            const text = (el.textContent || el.getAttribute('aria-label') || '').trim();
+            if (/next|›|»/i.test(text)) {
+              sawNext = true;
+              continue;
+            }
+            const num = parseInt(text, 10);
+            if (!isNaN(num) && num > 0 && num < 1000) {
+              numbers.add(num);
+            }
+          }
+        } catch (_) { /* ignore */ }
+      }
+
+      // Fallback: scan hrefs with page param
+      if (numbers.size === 0) {
+        const links = Array.from(document.querySelectorAll('a[href*="page="]'));
+        for (const a of links) {
+          const match = a.href.match(/[?&]page=(\d+)/);
+          if (match) {
+            const num = parseInt(match[1], 10);
+            if (!isNaN(num) && num > 0 && num < 1000) {
+              numbers.add(num);
+            }
+          }
+        }
+      }
+
+      if (numbers.size === 0) {
+        
+        return null;
+      }
+
+      let max = Math.max(...numbers);
+      if (sawNext) max++;
+
+      
+      return max;
+    } catch (e) {
+      warn('aliexpressMaxPage error:', e.message);
+      return null;
+    }
   }
 
   /* ------------------------------------------------------------------ *
@@ -1889,6 +2102,11 @@ function sleepPaced(ms, run) {
           return;
         }
       }
+      if (SITE === 'aliexpress') {
+        // AliExpress doesn't need special grid wait, but check for blocking
+        if (!isCurrent(run)) return;
+        if (isBlockedPage()) { report(run, { error: 'blocked' }); return; }
+      }
       if (!isCurrent(run)) return;
 
       if (isBlockedPage()) { report(run, { error: 'blocked' }); return; }
@@ -1896,10 +2114,14 @@ function sleepPaced(ms, run) {
       let items = [];
       let priceStats = null;
       try {
-        const extraction = SITE === 'amazon' ? await extractAmazon(run) : null;
-        if (extraction) {
-          items = extraction.items;
-          priceStats = extraction.stats;
+        if (SITE === 'amazon') {
+          const extraction = await extractAmazon(run);
+          if (extraction) {
+            items = extraction.items;
+            priceStats = extraction.stats;
+          }
+        } else if (SITE === 'aliexpress') {
+          items = extractAliExpress();
         } else {
           items = extractEbay();
         }
@@ -1928,6 +2150,14 @@ function sleepPaced(ms, run) {
             log('[NO ITEMS] Reporting no-results');
             report(run, { error: 'no-results' });
           }
+        } else if (SITE === 'aliexpress') {
+          const hasProductLinks = document.querySelectorAll('a[href*="/item/"], a[href*="/i/"]').length > 0;
+          log('[NO ITEMS] AliExpress - hasProductLinks:', hasProductLinks);
+          if (hasProductLinks) {
+            report(run, { error: 'parse-failed' });
+          } else {
+            report(run, { error: 'no-results' });
+          }
         } else {
           const hasProductLinks = document.querySelectorAll('a[href*="/itm/"]').length > 0;
           log('[NO ITEMS] eBay - hasProductLinks:', hasProductLinks);
@@ -1949,12 +2179,14 @@ function sleepPaced(ms, run) {
         log('eBay max page detected:', maxPage);
         log('[REPORT] Sending eBay results:', items.length, 'items, maxPage:', maxPage);
         report(run, { items, maxPage });
+      } else if (SITE === 'aliexpress') {
+        // AliExpress: detect and report maxPage for pagination
+        const aliexpressMax = aliexpressMaxPage();
+        log('[REPORT] Sending AliExpress results:', items.length, 'items, maxPage:', aliexpressMax);
+        report(run, { items, maxPage: aliexpressMax });
       } else {
-        // DEBUG: Detect and report Amazon's maxPage so background knows when to stop
+        // Amazon
         const amazonMax = amazonMaxPage();
-        log('[DEBUG] Amazon page', window.location.href);
-        log('[DEBUG] Amazon items found:', items.length);
-        log('[DEBUG] Amazon maxPage detected:', amazonMax);
         log('[REPORT] Sending Amazon results:', items.length, 'items, maxPage:', amazonMax);
         report(run, { items, maxPage: amazonMax });
       }

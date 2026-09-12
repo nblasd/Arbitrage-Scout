@@ -27,6 +27,7 @@ const els = {
   progressText: $('progressText'),
   chipAmazon: $('chipAmazon'),
   chipEbay: $('chipEbay'),
+  chipAliexpress: $('chipAliexpress'),
   retry: $('btnRetry'),
   banner: $('banner'),
   resultsBox: $('resultsBox'),
@@ -37,6 +38,7 @@ const els = {
   readyHint: $('readyHint'),
   openAmazon: $('btnOpenAmazon'),
   openEbay: $('btnOpenEbay'),
+  openAliexpress: $('btnOpenAliexpress'),
   reset: $('btnReset'),
   debugLog: $('btnDebugLog'),
   toast: $('toast'),
@@ -56,6 +58,7 @@ const els = {
   analyzeElapsed: $('analyzeElapsed'),
   chipStepEbay: $('chipStepEbay'),
   chipStepAmazon: $('chipStepAmazon'),
+  chipStepAliexpress: $('chipStepAliexpress'),
   chipStepProfit: $('chipStepProfit'),
   analyzeRetry: $('btnAnalyzeRetry'),
   analyzeCancel: $('btnAnalyzeCancel'),
@@ -167,6 +170,7 @@ function render() {
 
   if (searching) {
     const amz = state.sites.amazon;
+    const ali = state.sites.aliexpress;
     const ebay = state.sites.ebay;
     const elapsed = Math.min(99, Math.floor((Date.now() - (state.startedAt || Date.now())) / 1000));
     const pageLimit = Number.isInteger(state.pageLimit) && state.pageLimit > 0 ? state.pageLimit : 3;
@@ -174,9 +178,11 @@ function render() {
     if (ebay.status === 'loading') {
       const page = ebay.page || 1;
       step = `Step 1 of 2 — searching eBay page ${page} of ${pageLimit}…`;
-    } else if ((ebay.status === 'done' || ebay.status === 'error') && amz.status === 'loading') {
-      const page = amz.page || 1;
-      step = `Step 2 of 2 — searching Amazon page ${page} of ${pageLimit} & comparing…`;
+    } else if ((ebay.status === 'done' || ebay.status === 'error') && (amz.status === 'loading' || ali.status === 'loading')) {
+      const pages = [];
+      if (amz.status === 'loading') pages.push(`Amazon page ${amz.page || 1} of ${pageLimit}`);
+      if (ali.status === 'loading') pages.push(`AliExpress page ${ali.page || 1} of ${pageLimit}`);
+      step = `Step 2 of 2 — searching ${pages.join(' & ')} & comparing…`;
     } else {
       step = 'Comparing results…';
     }
@@ -192,9 +198,10 @@ function render() {
 
   renderChip(els.chipEbay, els.chipEbay.querySelector('.lbl'), 'eBay', state.sites.ebay);
   renderChip(els.chipAmazon, els.chipAmazon.querySelector('.lbl'), 'Amazon', state.sites.amazon);
+  renderChip(els.chipAliexpress, els.chipAliexpress.querySelector('.lbl'), 'AliExpress', state.sites.aliexpress);
 
   // "Parse again" appears whenever some site is in an error state.
-  const anyError = ['ebay', 'amazon'].some((s) => state.sites[s].status === 'error');
+  const anyError = ['ebay', 'amazon', 'aliexpress'].some((s) => state.sites[s].status === 'error');
   els.retry.classList.toggle('hidden', !anyError);
 
   renderBanner();
@@ -203,10 +210,10 @@ function render() {
 
 function renderBanner() {
   const lines = [];
-  for (const s of ['ebay', 'amazon']) {
+  for (const s of ['ebay', 'amazon', 'aliexpress']) {
     const st = state.sites[s];
     if (st.status === 'error') {
-      const name = s === 'amazon' ? 'Amazon' : 'eBay';
+      const name = s === 'amazon' ? 'Amazon' : s === 'aliexpress' ? 'AliExpress' : 'eBay';
       const label = ERROR_LABELS[st.error] || st.error;
       if (st.error === 'blocked') {
         lines.push(`<b>${name}</b> served a bot check (${label}). ` +
@@ -218,7 +225,7 @@ function renderBanner() {
       } else if (st.error === 'closed') {
         lines.push(`<b>${name}</b> results tab was closed (${label}).`);
       } else {
-        lines.push(`<b>${s === 'amazon' ? 'Amazon' : 'eBay'}</b>: ${label}.`);
+        lines.push(`<b>${name}</b>: ${label}.`);
       }
     }
   }
@@ -562,8 +569,10 @@ async function resetData() {
   // Reset chips to idle state
   els.chipEbay.classList.remove('busy', 'done', 'err');
   els.chipAmazon.classList.remove('busy', 'done', 'err');
+  els.chipAliexpress.classList.remove('busy', 'done', 'err');
   els.chipEbay.querySelector('.lbl').textContent = 'eBay: waiting';
   els.chipAmazon.querySelector('.lbl').textContent = 'Amazon: waiting';
+  els.chipAliexpress.querySelector('.lbl').textContent = 'AliExpress: waiting';
 
   // Clear table rows and summary
   els.rows.innerHTML = '';
@@ -745,9 +754,13 @@ function renderAnalyze() {
 
   renderAnalyzeChip(els.chipStepEbay, 'eBay', st.stages.ebay.status, st.stages.ebay.error);
   const amz = st.stages.amazon;
+  const ali = st.stages.aliexpress;
   const amzHint = (amz.status === 'loading' && amz.pagesDone > 0 && Number.isInteger(amz.pagesPerSite))
     ? `page ${amz.pagesDone}/${amz.pagesPerSite}` : null;
   renderAnalyzeChip(els.chipStepAmazon, 'Amazon', amz.status, amz.error, amzHint);
+  const aliHint = (ali.status === 'loading' && ali.pagesDone > 0 && Number.isInteger(ali.pagesPerSite))
+    ? `page ${ali.pagesDone}/${ali.pagesPerSite}` : null;
+  renderAnalyzeChip(els.chipStepAliexpress, 'AliExpress', ali.status, ali.error, aliHint);
   const profitStatus = st.phase === 'calculating' ? 'loading'
     : st.phase === 'done' && st.profit ? 'done' : 'idle';
   renderAnalyzeChip(els.chipStepProfit, 'Profit', profitStatus, null);
@@ -764,10 +777,10 @@ function renderAnalyze() {
 
   // Phase 3: blocked-stage recovery banner. failAnalyzeStage deliberately
   // keeps the blocked stage's tab OPEN — that tab is the CAPTCHA surface.
-  const blockedStage = ['ebay', 'amazon'].find((s) =>
+  const blockedStage = ['ebay', 'amazon', 'aliexpress'].find((s) =>
     st.stages[s].status === 'error' && st.stages[s].error === 'blocked');
   if (st.phase === 'error' && blockedStage) {
-    const name = blockedStage === 'amazon' ? 'Amazon' : 'eBay';
+    const name = blockedStage === 'amazon' ? 'Amazon' : (blockedStage === 'aliexpress' ? 'AliExpress' : 'eBay');
     els.blockedRecoveryMsg.innerHTML =
       `<b>${name} requires verification.</b> Please complete the CAPTCHA in the opened tab, then click <b>Retry</b>.`;
     els.blockedRecovery.classList.remove('hidden');
@@ -1257,6 +1270,7 @@ function init() {
   els.retry.addEventListener('click', forceParse);
   els.openEbay.addEventListener('click', () => openResults('ebay'));
   els.openAmazon.addEventListener('click', () => openResults('amazon'));
+  els.openAliexpress.addEventListener('click', () => openResults('aliexpress'));
   els.reset.addEventListener('click', resetData);
 
   els.feeRate.addEventListener('change', () => {

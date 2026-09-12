@@ -29,7 +29,7 @@ eBay URL
 validateEbayUrl()          host allowlist + /itm/<id> extraction → canonical URL
    │                        errors: INVALID_URL / NOT_EBAY_ITEM
    ▼
-extractEbayData(url)       fetch (real tab in Phase 2; fetch()-able for tests)
+extractEbayData(url)       fetch (real tab in Phase 2)
    │                       → title, price, shipping, condition, description,
    │                         item specifics (brand / MPN / model / UPC / EAN)
    │                       errors: FETCH_FAILED / TIMEOUT / PARSE_FAILED / NO_TITLE
@@ -58,8 +58,7 @@ matchAmazonProduct()       scores the best of up to 80 aggregated candidates (sp
 ```
 
 All failures surface as `MatchError` with a stable `code` (`ARBScout.ERROR_CODES`)
-and a ready-to-display `userMessage`. Run the engine's tests with
-`node test_phase1.js` (no dependencies).
+and a ready-to-display `userMessage`.
 
 ## Phase 2 — Analyze flow: eBay URL → Amazon match → profit → popup card
 
@@ -130,7 +129,7 @@ in the popup's ⚙ Settings and persisted in `chrome.storage.local`.
 
 Phase 3 hardens the analyze flow for real-world edge cases. All new logic is
 pure (`safety.js`, `export.js`, `cleanup.js` — no DOM/chrome APIs) so it runs
-in the service worker, the popup, and the `node test_phase3.js` harness.
+in the service worker and the popup.
 
 ```
 ebayProduct + matched amazonProduct
@@ -200,18 +199,12 @@ file (``arbitrage-lead-YYYY-MM-DD.csv``) or the clipboard directly.
 | `content.js`     | Runs on the real Amazon/eBay search-result pages in real tabs. Waits with random human-like delays, scrolls gently, then extracts listings with **cascading selector fallbacks** ending in a generic anchor scan. Reports `ARB_RESULTS`. **Phase 3:** detects CAPTCHA/bot-check pages (reports `blocked`), and parses Amazon `/dp/` product pages (buybox) for the manual-ASIN override. |
 | `background.js`  | MV3 service worker orchestrator. Opens one marketplace tab at a time, collects scrape results, watchdog-timeouts stuck stages via `chrome.alarms`, persists run state in `chrome.storage.session` (survives worker restarts), and pairs items with greedy title-similarity matching. Also loads `ebay2amazon.js` via `importScripts` for the Phase-1 engine. **Phase 3:** analyze-flow stages with blocked-tab CAPTCHA recovery, `ARB_ANALYZE_MANUAL_MATCH` (ASIN/URL override), and `closeOwnedTab`/`sweepOrphanTabs` guaranteeing zero orphaned tabs. |
 | `matcher.js`     | Multi-signal pairing engine (attributes, hard-conflict detection, category awareness) layered over title similarity for the keyword-comparison flow. Drop-in: `importScripts` + replace `computePairs` with `ARBMatcher.buildPairs`. |
-| `ebay2amazon.js` | **Phase 1 engine:** `validateEbayUrl` → `extractEbayData` (eBay item data) → `cleanTitleAndBuildQuery` (spam strip, bundle detection, query build) → `matchAmazonProduct` (confidence-scored Amazon match). Zero dependencies, environment-agnostic (service worker + Node tests). Also `buildAmazonSearchUrl` for Phase 2. |
+| `ebay2amazon.js` | **Phase 1 engine:** `validateEbayUrl` → `extractEbayData` (eBay item data) → `cleanTitleAndBuildQuery` (spam strip, bundle detection, query build) → `matchAmazonProduct` (confidence-scored Amazon match). Zero dependencies, environment-agnostic (service worker). Also `buildAmazonSearchUrl` for Phase 2. |
 | `profit.js` | **Phase 2 profit engine:** `calculateArbitrageProfit(ebay, amazon, settings)` — revenue/sourcing/fees/net/ROI/margin with user-configurable rates, Prime-aware shipping, warning strings and human-readable breakdown lines. Pure math (worker + popup + Node). |
 | `content-item.js` | **Phase 2:** runs on `ebay.com/itm/*` pages, reuses the Phase-1 extractor to parse the open listing, reports `ARB_ITEM_DATA`. Same run-token/anti-hang pattern as `content.js`. |
 | `safety.js`   | **Phase 3 safety harness:** `detectVariationMismatch` (color/size/style/capacity guard + generic-parent-asin detection) and `checkQuantityAlignment` (multipack vs single-unit hard alert). Pure logic, environment-agnostic. |
 | `cleanup.js`  | **Phase 3 orphan-tab registry:** `registerScrapeTab` / `unregisterScrapeTab` / `getOwnedScrapeTabs` in `chrome.storage.session` — the data layer behind `sweepOrphanTabs()` in `background.js`. |
-| `export.js`   | **Phase 3 lead export:** `buildBreakdownText` (clipboard paste) and `buildCsv` (RFC-4180 spreadsheet rows with safety alerts). Pure, testable. |
-| `test_phase1.js` | Dependency-free Node test harness for `ebay2amazon.js` — run `node test_phase1.js` (22 tests: URL validation, bundle parsing, query strategies, extraction fixtures, matching pipeline, error codes). |
-| `test_phase2.js` | Dependency-free Node test harness for `profit.js` — run `node test_phase2.js` (8 hand-computed cases: formulas, defaults, Prime shipping, clamping, degradation). |
-| `test_phase3.js` | Dependency-free Node test harness for the Phase-3 modules (21 tests): variation/quantity guards, export clipboard+CSV, orphan-tab registry, ASIN validation and the manual-match recalculate pipeline. |
-| `test_amazon_price.js` | Dependency-free Node tests for the content script's `amazonPrice()` cascade (12 tests: `.a-price .a-offscreen` layouts, `.a-price-whole` + fraction, hydration data attributes, strike/list-price rejection, `[data-asin]` card escalation, never-throw contract). |
-| `test_background_sim.js` | Node VM harness that loads the real `background.js` + real matcher with stubbed `chrome.*` APIs (12 scenarios: multi-page pagination, fallback query plan, premature-close guards, paced query advances on redirect fast-fails, price-parse recovery, CAPTCHA retry tab reuse, manual ASIN, crowded-page rank-13 match, and the popup `match.bestMatch` contract — populated only with the ACCEPTED match, never a below-threshold candidate). |
-| `test_match_confidence.js` | Dependency-free Node tests for the real `matchAmazonProduct()` (7 tests: exact candidate clears the 50% floor, stuffed-title pages still match, candidate cap keeps rank-13 crowded genuine matches scoreable, `matches[]` lists every candidate ≥50%, unrelated/empty results fail cleanly with `LOW_CONFIDENCE` / `NO_AMAZON_RESULTS`). |
+| `export.js`   | **Phase 3 lead export:** `buildBreakdownText` (clipboard paste) and `buildCsv` (RFC-4180 spreadsheet rows with safety alerts). Pure logic. |
 | `popup.html`     | Popup UI: search box + Compare button, progress chips, error banner, sortable results table, fee-% control. **Phase 3:** safety-badge box, blocked-CAPTCHA banner, manual ASIN/URL override, Copy Breakdown / Export CSV buttons. Styles inlined; **no inline scripts** (CSP-safe). |
 | `popup.js`       | Popup controller: renders state pushes, computes fees/profit/margin from the current fee % client-side, sorts on header click. **Phase 3:** paints safety alerts, blocked-recovery actions, manual-match recalculate and CSV/clipboard export. |
 
@@ -300,14 +293,6 @@ file (``arbitrage-lead-YYYY-MM-DD.csv``) or the clipboard directly.
 | `safety.js` → descriptor word lists | `COLOR_WORDS` / `SIZE_WORDS` / `STYLE_WORDS` / `CAPACITY_RE` — add/remove variation vocabulary without touching the guards. |
 
 ## Final verification checklist (all 3 phases — ready for local unpacking)
-
-Run the full dependency-free test suite first (must be green):
-
-```bash
-node test_phase1.js   # Phase 1  engine  — 22 tests
-node test_phase2.js   # Phase 2  profit  —  8 tests
-node test_phase3.js   # Phase 3  safety / export / cleanup — 21 tests
-```
 
 | # | Phase 1 — eBay→Amazon match engine | Status |
 |---|------------------------------------|--------|

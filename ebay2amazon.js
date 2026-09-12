@@ -1455,6 +1455,13 @@
    * 15. Public surface + export shim                                     *
    * ==================================================================== */
 
+  function buildAliExpressSearchUrl(query, page) {
+    const q = S(query).trim();
+    if (!q) throw new MatchError(ERROR_CODES.NO_QUERY, 'Empty AliExpress search query');
+    const p = Math.max(1, Math.floor(Number(page) || 1));
+    return `https://www.aliexpress.com/wholesale?SearchText=${encodeURIComponent(q)}&page=${p}`;
+  }
+
   const ARBScout = {
     ERROR_CODES,
     MatchError,
@@ -1462,6 +1469,7 @@
     validateEbayUrl,
     validateAmazonAsin,
     buildAmazonSearchUrl,
+    buildAliExpressSearchUrl,
     extractEbayData,
     extractFromDocument,
     cleanTitleAndBuildQuery,
