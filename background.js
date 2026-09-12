@@ -1324,7 +1324,7 @@ async function analyzeBuildQueryAndSearch() {
     await navigateAnalyzeAmazonTab(st.queries[0], 1);
     // Also open AliExpress search tab
     if (aliSt) {
-      await navigateAnalyzeAliExpressTab(q.query, 1);
+      await navigateAnalyzeAliExpressTab(aliSt.query, 1);
     }
   } catch (e) {
     console.warn('[arb] could not open Amazon tab:', e);
