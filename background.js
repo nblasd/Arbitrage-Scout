@@ -615,8 +615,25 @@ async function failStage(site, reason) {
   await commit();
 
   if (site === 'ebay') {
-    await openSearchTab('amazon', { page: 1, resetItems: true });
-    await openSearchTab('aliexpress', { page: 1, resetItems: true });
+    // Extract a clean search query from eBay data for Amazon/AliExpress searches
+    let searchQuery = cache.query;
+    try {
+      // Try to use the eBay product title if available
+      if (cache.sites.ebay && cache.sites.ebay.items && cache.sites.ebay.items.length > 0) {
+        const ebayItem = cache.sites.ebay.items[0];
+        if (ebayItem.title) {
+          // Use the same cleaning logic as analyze flow
+          const qInfo = self.ARBScout.cleanTitleAndBuildQuery(ebayItem.title, ebayItem.specifics || {});
+          searchQuery = qInfo.query;
+          console.log(`[arb] [DEBUG] Using cleaned query for Amazon/AliExpress: "${searchQuery}" (strategy: ${qInfo.strategy})`);
+        }
+      }
+    } catch (e) {
+      console.warn('[arb] Could not clean query, using original:', e.message);
+    }
+    
+    await openSearchTab('amazon', { page: 1, resetItems: true, query: searchQuery });
+    await openSearchTab('aliexpress', { page: 1, resetItems: true, query: searchQuery });
   } else await finalizeRun();
 }
 
