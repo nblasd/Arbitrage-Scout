@@ -1470,6 +1470,123 @@ async function handleAnalyzeAmazonResults(msg, sender) {
 }
 
 /**
+ * Handle ARB_RESULTS from the AliExpress search tab while an analyze run is in
+ * the 'searching-amazon' phase (we use the same phase for both platforms).
+ */
+async function handleAnalyzeAliExpressResults(msg, sender) {
+  await ensureAnalyzeState();
+  if (!analyzeCache || analyzeCache.phase !== 'searching-amazon') return;
+  const st = analyzeCache.stages.aliexpress;
+  if (!st || st.status !== 'loading') {
+    return;
+  }
+
+  const senderTabId = sender && sender.tab ? sender.tab.id : null;
+  if (st.tabId != null && senderTabId !== st.tabId) {
+    return;
+  }
+
+  // Get pagesPer early to avoid initialization issues
+  const pagesPer = analyzeAmazonPagesPerSite();
+
+  // Alignment guards dodge stale payloads from earlier pages.
+  const msgPage = (Number.isInteger(Math.floor(Number(msg.page))) ? Math.floor(Number(msg.page)) : 1);
+  if (st.page && Number.isInteger(st.page) && msgPage !== st.page) {
+    if (msgPage > st.page) return;
+    // AliExpress redirects similar to Amazon
+    console.log(`[ARBScout] AliExpress redirected page ${st.page} -> ${msgPage}; end of pagination`);
+    if ((st.items || []).length > 0) await settleAnalyzeAliExpressStage('AliExpress redirected to an earlier page (end of pagination)');
+    else await failAnalyzeStage('aliexpress', 'no-results');
+    return;
+  }
+
+  clearItemWatch('aliexpress');
+
+  /* ---- Failed page payload ------------------------------------------ */
+  if (msg.error) {
+    if (msg.error === 'price-parse' && msg.skippedForPrice) {
+      console.log(`[ARBScout] AliExpress price parse: ${msg.skippedForPrice} cards had no parsable price`);
+    }
+    await handleAnalyzeAliExpressError(msg.error);
+    return;
+  }
+
+  /* ---- Success: aggregate this page's candidates -------------------- */
+  const pageItems = Array.isArray(msg.items) ? msg.items : [];
+  console.log('[ARBScout] Received payload from AliExpress content script:', pageItems.length);
+  // A successful page re-arms the one-shot price-parse retry budget.
+  st.priceParseRetried = false;
+  st.consecutivePageErrors = 0;
+  st.pagesDone = Math.max(st.pagesDone || 0, msgPage);
+  st.items = mergeAnalyzeAmazonItems(st.items || [], pageItems);
+  await commitAnalyze();
+
+  // Log current collection progress for debugging
+  console.log(`[ARBScout] AliExpress Progress: ${(st.items || []).length}/${ANALYZE_MAX_AMAZON_ITEMS} items collected, continuing to page ${msgPage + 1}/${pagesPer}`);
+
+  // Candidate cap reached — no point crawling more pages.
+  if ((st.items || []).length >= ANALYZE_MAX_AMAZON_ITEMS) {
+    console.log(`[ARBScout] AliExpress reached candidate cap ${ANALYZE_MAX_AMAZON_ITEMS} — finishing early`);
+    await settleAnalyzeAliExpressStage('candidate cap reached');
+    return;
+  }
+
+  // Last requested page consumed — settle (pagination window over).
+  console.log(`[ARBScout] AliExpress Page check: msgPage=${msgPage}, pagesPer=${pagesPer}, condition=${msgPage >= pagesPer}`);
+  if (msgPage >= pagesPer) {
+    console.log(`[ARBScout] AliExpress page ${msgPage}/${pagesPer} parsed — pagination complete`);
+    await settleAnalyzeAliExpressStage('pagination window complete');
+    return;
+  }
+
+  // Keep the SAME tab open and crawl the next page with a human-like pause.
+  const nextDelay = AMAZON_PAGE_DELAY_MIN_MS +
+    Math.floor(Math.random() * (AMAZON_PAGE_DELAY_MAX_MS - AMAZON_PAGE_DELAY_MIN_MS + 1));
+  console.log(`[ARBScout] Waiting ${nextDelay}ms before next AliExpress page (current: ${msgPage}, target: ${pagesPer})`);
+  await new Promise((resolve) => setTimeout(resolve, nextDelay));
+  if (!analyzeCache || analyzeCache.phase !== 'searching-amazon' ||
+      analyzeCache.stages.aliexpress.status !== 'loading') {
+    console.log(`[ARBScout] Aborting AliExpress pagination: cache=${!!analyzeCache}, phase=${analyzeCache?.phase}, status=${analyzeCache?.stages?.aliexpress?.status}`);
+    return;
+  }
+  console.log(`[ARBScout] Crawling AliExpress page ${msgPage + 1}/${pagesPer} of query "${String(st.query).slice(0, 40)}"`);
+  await navigateAnalyzeAliExpressTab(st.query, msgPage + 1);
+}
+
+/**
+ * React to a per-page error from the AliExpress tab.
+ */
+async function handleAnalyzeAliExpressError(reason) {
+  const st = analyzeCache.stages.aliexpress;
+  if (reason === 'blocked' || reason === 'timeout') {
+    await failAnalyzeStage('aliexpress', reason);
+    return;
+  }
+  if ((st.items || []).length > 0) {
+    console.log(`[ARBScout] AliExpress page error "${reason}" but ${st.items.length} candidates exist — settling on scraped data`);
+    await settleAnalyzeAliExpressStage('page error with held candidates');
+    return;
+  }
+  if (reason === 'price-parse' && !st.priceParseRetried) {
+    st.priceParseRetried = true;
+    const query = st.query;
+    const page = st.page || 1;
+    console.log(`[ARBScout] AliExpress price parse failed with 0 candidates — retrying "${String(query).slice(0, 40)}" page ${page} once in the same tab`);
+    await new Promise((resolve) => setTimeout(resolve, AMAZON_PAGE_DELAY_MIN_MS +
+      Math.floor(Math.random() * (AMAZON_PAGE_DELAY_MAX_MS - AMAZON_PAGE_DELAY_MIN_MS + 1))));
+    try {
+      await navigateAnalyzeAliExpressTab(query, page);
+    } catch (e) {
+      console.warn('[ARBScout] AliExpress price-parse retry navigation failed:', e && e.message);
+      await failAnalyzeStage('aliexpress', 'no-results');
+    }
+    return;
+  }
+  // Fail the stage
+  await failAnalyzeStage('aliexpress', 'no-results');
+}
+
+/**
  * React to a per-page error from the Amazon tab. 'blocked' / 'timeout' fail
  * the stage immediately (the CAPTCHA tab stays open for 'blocked'). Other
  * errors only fail after the fallback query plan is exhausted — if we already
@@ -1568,7 +1685,32 @@ async function settleAnalyzeAmazonStage(reason) {
   analyzeCache.amazonResults = (st.items || []).slice(0, ANALYZE_MAX_AMAZON_ITEMS);
   console.log(`[ARBScout] Amazon stage done — ${analyzeCache.amazonResults.length} candidates for matching`);
   await commitAnalyze();
-  await finalizeAnalyze();
+  // Don't finalize yet - wait for AliExpress to finish
+  // Check if AliExpress is also done
+  const aliSt = analyzeCache.stages.aliexpress;
+  if (aliSt && aliSt.status === 'done') {
+    await finalizeAnalyze();
+  }
+}
+
+/** Settle the AliExpress stage and finalize the analysis */
+async function settleAnalyzeAliExpressStage(reason) {
+  await ensureAnalyzeState();
+  if (!analyzeCache) return;
+  const st = analyzeCache.stages.aliexpress;
+  const tabId = st.tabId;
+  st.tabId = null;
+  await closeOwnedTab(tabId, 'analyze:aliexpress');
+  st.status = 'done';
+  analyzeCache.aliexpressResults = (st.items || []).slice(0, ANALYZE_MAX_AMAZON_ITEMS);
+  console.log(`[ARBScout] AliExpress stage done — ${analyzeCache.aliexpressResults.length} candidates collected`);
+  await commitAnalyze();
+  
+  // Check if Amazon is also done
+  const amzSt = analyzeCache.stages.amazon;
+  if (amzSt && amzSt.status === 'done') {
+    await finalizeAnalyze();
+  }
 }
 
 /** (Re)establish the Amazon stage's pagination metadata (survives restarts). */
@@ -2110,6 +2252,7 @@ async function handleMessage(msg, sender) {
       // handleResults ignore analyze runs) and the Phase-2 analyze run.
       await handleResults(msg, sender);
       await handleAnalyzeAmazonResults(msg, sender);
+      await handleAnalyzeAliExpressResults(msg, sender);
       return {};
     }
     case 'ARB_ITEM_DATA': {
@@ -2135,7 +2278,8 @@ async function handleMessage(msg, sender) {
       return {};
     }
     case 'ARB_ANALYZE_FOCUS_TAB': {
-      await focusAnalyzeStageTab(msg.stage === 'amazon' ? 'amazon' : 'ebay');
+      const stage = msg.stage === 'amazon' ? 'amazon' : (msg.stage === 'aliexpress' ? 'aliexpress' : 'ebay');
+      await focusAnalyzeStageTab(stage);
       return {};
     }
     case 'ARB_ANALYZE_MANUAL_MATCH': {

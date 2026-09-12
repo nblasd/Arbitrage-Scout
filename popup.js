@@ -754,9 +754,13 @@ function renderAnalyze() {
 
   renderAnalyzeChip(els.chipStepEbay, 'eBay', st.stages.ebay.status, st.stages.ebay.error);
   const amz = st.stages.amazon;
+  const ali = st.stages.aliexpress;
   const amzHint = (amz.status === 'loading' && amz.pagesDone > 0 && Number.isInteger(amz.pagesPerSite))
     ? `page ${amz.pagesDone}/${amz.pagesPerSite}` : null;
   renderAnalyzeChip(els.chipStepAmazon, 'Amazon', amz.status, amz.error, amzHint);
+  const aliHint = (ali.status === 'loading' && ali.pagesDone > 0 && Number.isInteger(ali.pagesPerSite))
+    ? `page ${ali.pagesDone}/${ali.pagesPerSite}` : null;
+  renderAnalyzeChip(els.chipStepAliexpress, 'AliExpress', ali.status, ali.error, aliHint);
   const profitStatus = st.phase === 'calculating' ? 'loading'
     : st.phase === 'done' && st.profit ? 'done' : 'idle';
   renderAnalyzeChip(els.chipStepProfit, 'Profit', profitStatus, null);
@@ -773,10 +777,10 @@ function renderAnalyze() {
 
   // Phase 3: blocked-stage recovery banner. failAnalyzeStage deliberately
   // keeps the blocked stage's tab OPEN — that tab is the CAPTCHA surface.
-  const blockedStage = ['ebay', 'amazon'].find((s) =>
+  const blockedStage = ['ebay', 'amazon', 'aliexpress'].find((s) =>
     st.stages[s].status === 'error' && st.stages[s].error === 'blocked');
   if (st.phase === 'error' && blockedStage) {
-    const name = blockedStage === 'amazon' ? 'Amazon' : 'eBay';
+    const name = blockedStage === 'amazon' ? 'Amazon' : (blockedStage === 'aliexpress' ? 'AliExpress' : 'eBay');
     els.blockedRecoveryMsg.innerHTML =
       `<b>${name} requires verification.</b> Please complete the CAPTCHA in the opened tab, then click <b>Retry</b>.`;
     els.blockedRecovery.classList.remove('hidden');
