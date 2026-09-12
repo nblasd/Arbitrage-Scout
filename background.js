@@ -906,6 +906,22 @@ function newAmazonStage() {
   };
 }
 
+function newAliExpressStage() {
+  return {
+    status: 'idle',
+    error: null,
+    tabId: null,
+    query: null,
+    page: 1,
+    pagesDone: 0,
+    pagesPerSite: 1,
+    items: [],
+    priceParseRetried: false,
+    noResultsRetried: false,
+    maxPage: null
+  };
+}
+
 function newAnalyzeState(url, runId, settings) {
   return {
     runId,
@@ -917,11 +933,13 @@ function newAnalyzeState(url, runId, settings) {
     manualMatch: null, // Phase 3: { asin, url, appliedAt } when user-corrected
     stages: {
       ebay: { status: 'idle', error: null, tabId: null },
-      amazon: newAmazonStage()
+      amazon: newAmazonStage(),
+      aliexpress: newAliExpressStage()
     },
     ebayProduct: null,
     queryInfo: null,   // cleanTitleAndBuildQuery() result (strategy, gtin, …)
     amazonResults: [],
+    aliexpressResults: [],
     match: null,       // matchAmazonProduct() result (candidates included)
     safety: null,      // Phase 3: assessSafety() result for the matched pair
     profit: null,      // calculateArbitrageProfit() result
@@ -1232,12 +1250,30 @@ async function analyzeBuildQueryAndSearch() {
   st.priceParseRetried = false;
   st.pagesPerSite = analyzeAmazonPagesPerSite();
   console.log(`[ARBScout] Amazon stage init: pagesPerSite=${st.pagesPerSite}, queries=${plan.length}`);
+  
+  // Initialize AliExpress stage as well
+  const aliSt = analyzeCache.stages.aliexpress;
+  if (aliSt) {
+    aliSt.query = q.query;
+    aliSt.page = 1;
+    aliSt.pagesDone = 0;
+    aliSt.items = [];
+    aliSt.priceParseRetried = false;
+    aliSt.noResultsRetried = false;
+    aliSt.pagesPerSite = analyzeAmazonPagesPerSite(); // Use same setting
+    console.log(`[ARBScout] AliExpress stage init: pagesPerSite=${aliSt.pagesPerSite}`);
+  }
+  
   analyzeCache.phase = 'searching-amazon';
   await commitAnalyze();
   console.log(`[ARBScout] Amazon query plan (${plan.length}):`, plan);
 
   try {
     await navigateAnalyzeAmazonTab(st.queries[0], 1);
+    // Also open AliExpress search tab
+    if (aliSt) {
+      await navigateAnalyzeAliExpressTab(q.query, 1);
+    }
   } catch (e) {
     console.warn('[arb] could not open Amazon tab:', e);
     await failAnalyzeStage('amazon', 'parse-failed');
