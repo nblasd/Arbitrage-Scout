@@ -27,6 +27,7 @@ const els = {
   progressText: $('progressText'),
   chipAmazon: $('chipAmazon'),
   chipEbay: $('chipEbay'),
+  chipAliexpress: $('chipAliexpress'),
   retry: $('btnRetry'),
   banner: $('banner'),
   resultsBox: $('resultsBox'),
@@ -37,6 +38,7 @@ const els = {
   readyHint: $('readyHint'),
   openAmazon: $('btnOpenAmazon'),
   openEbay: $('btnOpenEbay'),
+  openAliexpress: $('btnOpenAliexpress'),
   reset: $('btnReset'),
   debugLog: $('btnDebugLog'),
   toast: $('toast'),
@@ -192,9 +194,10 @@ function render() {
 
   renderChip(els.chipEbay, els.chipEbay.querySelector('.lbl'), 'eBay', state.sites.ebay);
   renderChip(els.chipAmazon, els.chipAmazon.querySelector('.lbl'), 'Amazon', state.sites.amazon);
+  renderChip(els.chipAliexpress, els.chipAliexpress.querySelector('.lbl'), 'AliExpress', state.sites.aliexpress);
 
   // "Parse again" appears whenever some site is in an error state.
-  const anyError = ['ebay', 'amazon'].some((s) => state.sites[s].status === 'error');
+  const anyError = ['ebay', 'amazon', 'aliexpress'].some((s) => state.sites[s].status === 'error');
   els.retry.classList.toggle('hidden', !anyError);
 
   renderBanner();
@@ -203,10 +206,10 @@ function render() {
 
 function renderBanner() {
   const lines = [];
-  for (const s of ['ebay', 'amazon']) {
+  for (const s of ['ebay', 'amazon', 'aliexpress']) {
     const st = state.sites[s];
     if (st.status === 'error') {
-      const name = s === 'amazon' ? 'Amazon' : 'eBay';
+      const name = s === 'amazon' ? 'Amazon' : s === 'aliexpress' ? 'AliExpress' : 'eBay';
       const label = ERROR_LABELS[st.error] || st.error;
       if (st.error === 'blocked') {
         lines.push(`<b>${name}</b> served a bot check (${label}). ` +
@@ -218,7 +221,7 @@ function renderBanner() {
       } else if (st.error === 'closed') {
         lines.push(`<b>${name}</b> results tab was closed (${label}).`);
       } else {
-        lines.push(`<b>${s === 'amazon' ? 'Amazon' : 'eBay'}</b>: ${label}.`);
+        lines.push(`<b>${name}</b>: ${label}.`);
       }
     }
   }
@@ -562,8 +565,10 @@ async function resetData() {
   // Reset chips to idle state
   els.chipEbay.classList.remove('busy', 'done', 'err');
   els.chipAmazon.classList.remove('busy', 'done', 'err');
+  els.chipAliexpress.classList.remove('busy', 'done', 'err');
   els.chipEbay.querySelector('.lbl').textContent = 'eBay: waiting';
   els.chipAmazon.querySelector('.lbl').textContent = 'Amazon: waiting';
+  els.chipAliexpress.querySelector('.lbl').textContent = 'AliExpress: waiting';
 
   // Clear table rows and summary
   els.rows.innerHTML = '';
@@ -1257,6 +1262,7 @@ function init() {
   els.retry.addEventListener('click', forceParse);
   els.openEbay.addEventListener('click', () => openResults('ebay'));
   els.openAmazon.addEventListener('click', () => openResults('amazon'));
+  els.openAliexpress.addEventListener('click', () => openResults('aliexpress'));
   els.reset.addEventListener('click', resetData);
 
   els.feeRate.addEventListener('change', () => {

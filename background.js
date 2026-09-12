@@ -759,19 +759,36 @@ async function finalizeRun() {
   clearAllWatches();
   // Safety net: any stage tab still referenced at finalize time is closed.
   // (Normal flows already retire tabs in continue*Pagination / failStage.)
-  try { await closeOwnedTabs([cache.sites.ebay.tabId, cache.sites.amazon.tabId]); } catch (_) {}
+  try { await closeOwnedTabs([cache.sites.ebay.tabId, cache.sites.amazon.tabId, cache.sites.aliexpress.tabId]); } catch (_) {}
 
   const amz = cache.sites.amazon.items || [];
   const ebay = cache.sites.ebay.items || [];
+  const ali = cache.sites.aliexpress.items || [];
 
-  const matched = computePairs(amz, ebay);
-  cache.pairs = matched.pairs;
+  console.log(`[arb] [DEBUG] Finalize: Amazon=${amz.length}, eBay=${ebay.length}, AliExpress=${ali.length}`);
+
+  // Match eBay items with Amazon
+  const matchedAmzEbay = computePairs(amz, ebay);
+  
+  // Match eBay items with AliExpress
+  const matchedAliEbay = computePairs(ali, ebay);
+
+  // Combine pairs - prioritize by confidence score
+  const allPairs = [...matchedAmzEbay.pairs, ...matchedAliEbay.pairs.map(p => ({ ...p, source: 'aliexpress' }))];
+  
+  // Sort by similarity score and limit
+  allPairs.sort((a, b) => (b.sim || 0) - (a.sim || 0));
+  const finalPairs = allPairs.slice(0, MAX_PAIRS);
+
+  cache.pairs = finalPairs;
   cache.summary = {
-    pairs: matched.pairs.length,
+    pairs: finalPairs.length,
     amzTotal: amz.length,
     ebayTotal: ebay.length,
-    amzUsed: matched.amzUsed,
-    ebayUsed: matched.ebayUsed
+    aliexpressTotal: ali.length,
+    amzUsed: matchedAmzEbay.amzUsed,
+    ebayUsed: matchedAmzEbay.ebayUsed + matchedAliEbay.ebayUsed,
+    aliexpressUsed: matchedAliEbay.amzUsed // aliexpress items used
   };
   await commit();
 }
