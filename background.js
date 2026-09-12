@@ -67,6 +67,10 @@ const SEARCH_URLS = {
   ebay: (q, page) => {
     const p = Math.max(1, Number(page) || 1);
     return `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(q)}&_sacat=0&_pgn=${p}`;
+  },
+  aliexpress: (q, page) => {
+    const p = Math.max(1, Number(page) || 1);
+    return `https://www.aliexpress.com/wholesale?SearchText=${encodeURIComponent(q)}&page=${p}`;
   }
 };
 
@@ -187,9 +191,9 @@ function newRunState(query, runId, pageLimit) {
     phase: 'idle', // 'idle' | 'searching' | 'done'
     startedAt: null,
     doneAt: null,
-    sites: { amazon: emptySiteState(), ebay: emptySiteState() },
-    pairs: [],       // [{ sim, amazon: {…}, ebay: {…} }]
-    summary: { pairs: 0, amzTotal: 0, ebayTotal: 0, amzUsed: 0, ebayUsed: 0 }
+    sites: { amazon: emptySiteState(), ebay: emptySiteState(), aliexpress: emptySiteState() },
+    pairs: [],       // [{ sim, amazon: {…}, ebay: {…}, aliexpress: {…} }]
+    summary: { pairs: 0, amzTotal: 0, ebayTotal: 0, aliexpressTotal: 0, amzUsed: 0, ebayUsed: 0, aliexpressUsed: 0 }
   };
 }
 
@@ -246,7 +250,7 @@ async function sweepOrphanTabs() {
 
   const live = new Set();
   if (cache && cache.sites) {
-    for (const site of ['amazon', 'ebay']) {
+    for (const site of ['amazon', 'ebay', 'aliexpress']) {
       const ss = cache.sites[site];
       if (ss && ss.tabId != null) {
         // Live stage: keep. Blocked stage: keep too — the open tab is the
@@ -320,7 +324,7 @@ function clearWatch(site) {
 
 /** All watchdogs cancelled (run finished or a new one is starting). */
 function clearAllWatches() {
-  for (const site of ['amazon', 'ebay']) clearWatch(site);
+  for (const site of ['amazon', 'ebay', 'aliexpress']) clearWatch(site);
 }
 
 async function clearAlarmsForRun(runId) {
@@ -395,13 +399,13 @@ async function startRun(query, pageLimit) {
 async function openSearchTab(site, opts) {
   opts = opts || {};
   const ss = cache.sites[site];
-  const page = site === 'ebay' || site === 'amazon'
-    ? Math.max(1, Number(opts.page || ss.page || 1))
-    : 1;
-  const query = site === 'amazon'
-    ? amazonCrossReferenceQuery(cache.query, cache.sites.ebay.items || [])
-    : cache.query;
-  const url = site === 'ebay' ? SEARCH_URLS.ebay(query, page) : SEARCH_URLS.amazon(query, page);
+  const page = Math.max(1, Number(opts.page || ss.page || 1));
+  const query = cache.query;
+  let url;
+  if (site === 'ebay') url = SEARCH_URLS.ebay(query, page);
+  else if (site === 'amazon') url = SEARCH_URLS.amazon(query, page);
+  else if (site === 'aliexpress') url = SEARCH_URLS.aliexpress(query, page);
+  else url = SEARCH_URLS.amazon(query, page);
   let tab;
   try { tab = await chrome.tabs.get(ss.tabId); } catch (_) { tab = null; }
 
