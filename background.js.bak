@@ -1178,9 +1178,6 @@ async function handleAnalyzeAmazonResults(msg, sender) {
     return;
   }
 
-  // Get pagesPer early to avoid initialization issues
-  const pagesPer = analyzeAmazonPagesPerSite();
-
   // Alignment guards dodge stale payloads from earlier pages/queries.
   const activeQuery = analyzeCurrentQuery();
   if (!activeQuery) return;
@@ -1256,17 +1253,15 @@ async function handleAnalyzeAmazonResults(msg, sender) {
     return;
   }
 
+  // Candidate cap reached — no point crawling more pages.
+  }
+
   // Log current collection progress for debugging
   console.log(`[ARBScout] Progress: ${(st.items || []).length}/${ANALYZE_MAX_AMAZON_ITEMS} items collected, continuing to page ${msgPage + 1}/${pagesPer}`);
 
-  // Candidate cap reached — no point crawling more pages.
-  if ((st.items || []).length >= ANALYZE_MAX_AMAZON_ITEMS) {
-    console.log(`[ARBScout] Reached candidate cap ${ANALYZE_MAX_AMAZON_ITEMS} — finishing early (tab closes by design, match continues)`);
-    await settleAnalyzeAmazonStage('candidate cap reached');
-    return;
-  }
-
   // Last requested page consumed — settle (pagination window over).
+  const pagesPer = analyzeAmazonPagesPerSite();
+  if ((st.items || []).length >= ANALYZE_MAX_AMAZON_ITEMS) {
   console.log(`[ARBScout] Page check: msgPage=${msgPage}, pagesPer=${pagesPer}, condition=${msgPage >= pagesPer}`);
   if (msgPage >= pagesPer) {
     console.log(`[ARBScout] Amazon page ${msgPage}/${pagesPer} parsed — pagination complete`);
