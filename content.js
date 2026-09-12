@@ -1681,43 +1681,40 @@ function sleepPaced(ms, run) {
       const numbers = new Set();
       let sawNext = false;
 
-      // DEBUG: Log what we're finding
-      log('[DEBUG amazonMaxPage] Starting detection...');
-      
       // 1) Primary: Amazon's pagination container
       const paginationContainer = document.querySelector('.s-pagination-container');
-      log('[DEBUG amazonMaxPage] paginationContainer found:', !!paginationContainer);
+      
       
       if (paginationContainer) {
         // Get all page number links
         const pageLinks = paginationContainer.querySelectorAll('a[href*="page="], a[href*="ref=sr_pg_"]');
-        log('[DEBUG amazonMaxPage] pageLinks count:', pageLinks.length);
+        
         
         for (const link of pageLinks) {
           const text = (link.textContent || '').replace(/\s+/g, ' ').trim();
           const asNum = parseInt(text, 10);
           if (Number.isInteger(asNum) && asNum > 0 && asNum <= 500) {
             numbers.add(asNum);
-            log('[DEBUG amazonMaxPage] Found page number:', asNum);
+            
           }
           // Check for next button
           if (/next|siguiente|suivant|weiter|prossimo|avançar/i.test(text) || 
               /next|siguiente|suivant|weiter|prossimo|avançar/i.test(link.getAttribute('aria-label') || '')) {
             sawNext = true;
-            log('[DEBUG amazonMaxPage] Found Next button via link text');
+            
           }
         }
 
         // Also check for span/page elements with numbers
         const pageElements = paginationContainer.querySelectorAll('span, div, li');
-        log('[DEBUG amazonMaxPage] pageElements count:', pageElements.length);
+        
         
         for (const el of pageElements) {
           const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
           const asNum = parseInt(text, 10);
           if (Number.isInteger(asNum) && asNum > 0 && asNum <= 500) {
             numbers.add(asNum);
-            log('[DEBUG amazonMaxPage] Found page number from element:', asNum);
+            
           }
         }
       }
@@ -1725,7 +1722,7 @@ function sleepPaced(ms, run) {
       // 2) Fallback: scan all links with page parameter
       if (numbers.size === 0) {
         const links = document.querySelectorAll('a[href*="page="]');
-        log('[DEBUG amazonMaxPage] Fallback: scanning all page= links, count:', links.length);
+        
         
         for (const link of links) {
           const href = link.getAttribute('href') || '';
@@ -1734,7 +1731,7 @@ function sleepPaced(ms, run) {
             const asNum = parseInt(match[1], 10);
             if (Number.isInteger(asNum) && asNum > 0 && asNum <= 500) {
               numbers.add(asNum);
-              log('[DEBUG amazonMaxPage] Found page from href:', asNum);
+              
             }
           }
         }
@@ -1747,16 +1744,14 @@ function sleepPaced(ms, run) {
         );
         if (nextButton) {
           sawNext = true;
-          log('[DEBUG amazonMaxPage] Found Next button via selector');
+          
         }
       }
-
-      log('[DEBUG amazonMaxPage] numbers set:', [...numbers], 'sawNext:', sawNext);
 
       if (numbers.size) {
         const max = Math.max(...numbers);
         const result = sawNext ? Math.max(max, max + 1) : max;
-        log('[DEBUG amazonMaxPage] Returning maxPage:', result);
+        
         return result;
       }
 
@@ -1766,18 +1761,18 @@ function sleepPaced(ms, run) {
         const currentPage = parseInt(currentPageMatch[1], 10);
         // If we're on a page and there are results, assume at least this many pages exist
         const resultItems = document.querySelectorAll('[data-asin]');
-        log('[DEBUG amazonMaxPage] Current page from URL:', currentPage, 'resultItems:', resultItems.length);
+        
         
         if (resultItems.length > 0) {
-          log('[DEBUG amazonMaxPage] Returning current page as maxPage:', currentPage);
+          
           return currentPage;
         }
       }
 
-      log('[DEBUG amazonMaxPage] Amazon pagination element not found - maxPage unknown');
+      
       return null;
     } catch (e) {
-      warn('[DEBUG amazonMaxPage] error:', e.message);
+      warn('amazonMaxPage error:', e.message);
       return null;
     }
   }
@@ -1992,17 +1987,17 @@ function sleepPaced(ms, run) {
       }
 
       if (numbers.size === 0) {
-        log('[DEBUG aliexpressMaxPage] No pagination numbers found');
+        
         return null;
       }
 
       let max = Math.max(...numbers);
       if (sawNext) max++;
 
-      log('[DEBUG aliexpressMaxPage] Found pages:', [...numbers], 'sawNext:', sawNext, 'max:', max);
+      
       return max;
     } catch (e) {
-      warn('[DEBUG aliexpressMaxPage] error:', e.message);
+      warn('aliexpressMaxPage error:', e.message);
       return null;
     }
   }
@@ -2187,17 +2182,11 @@ function sleepPaced(ms, run) {
       } else if (SITE === 'aliexpress') {
         // AliExpress: detect and report maxPage for pagination
         const aliexpressMax = aliexpressMaxPage();
-        log('[DEBUG] AliExpress page', window.location.href);
-        log('[DEBUG] AliExpress items found:', items.length);
-        log('[DEBUG] AliExpress maxPage detected:', aliexpressMax);
         log('[REPORT] Sending AliExpress results:', items.length, 'items, maxPage:', aliexpressMax);
         report(run, { items, maxPage: aliexpressMax });
       } else {
         // Amazon
         const amazonMax = amazonMaxPage();
-        log('[DEBUG] Amazon page', window.location.href);
-        log('[DEBUG] Amazon items found:', items.length);
-        log('[DEBUG] Amazon maxPage detected:', amazonMax);
         log('[REPORT] Sending Amazon results:', items.length, 'items, maxPage:', amazonMax);
         report(run, { items, maxPage: amazonMax });
       }

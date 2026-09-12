@@ -539,16 +539,13 @@ async function continueAmazonPagination() {
     userLimit
   );
   const nextPage = (ss.page || 1) + 1;
-  
-  // DEBUG: Log pagination decision
-  console.log(`[arb] [DEBUG] continueAmazonPagination: page=${ss.page}, nextPage=${nextPage}, amazonMaxPages=${amazonMaxPages}, userLimit=${userLimit}, ss.maxPage=${ss.maxPage}`);
-  
+
   // A successful page payload re-arms the one-shot price-parse retry so a
   // later page's hydration hiccup still gets its own bounded retry.
   ss.priceParseRetried = false;
   ss.noResultsRetried = false; // same for the paced no-results retry
   if (nextPage <= amazonMaxPages) {
-    console.log(`[arb] [DEBUG] Continuing to Amazon page ${nextPage}`);
+    
     // Rate-limit handling: add a random human-like delay between Amazon page
     // navigations to avoid triggering bot detection.
     const delayMs = AMAZON_PAGE_DELAY_MIN_MS +
@@ -558,7 +555,7 @@ async function continueAmazonPagination() {
     return;
   }
 
-  console.log(`[arb] [DEBUG] Stopping Amazon pagination at page ${ss.page} (nextPage=${nextPage} > amazonMaxPages=${amazonMaxPages})`);
+  
   ss.status = 'done';
   await commit();
   await retireSearchStageTab('amazon'); // Amazon capture complete: reclaim its tab
@@ -626,7 +623,6 @@ async function failStage(site, reason) {
           // Use the same cleaning logic as analyze flow
           const qInfo = self.ARBScout.cleanTitleAndBuildQuery(ebayItem.title, ebayItem.specifics || {});
           searchQuery = qInfo.query;
-          console.log(`[arb] [DEBUG] Using cleaned query for Amazon/AliExpress: "${searchQuery}" (strategy: ${qInfo.strategy})`);
         }
       }
     } catch (e) {
@@ -637,7 +633,6 @@ async function failStage(site, reason) {
     await openSearchTab('aliexpress', { page: 1, resetItems: true, query: searchQuery });
   } else await finalizeRun();
 }
-
 
 /** Handle ARB_RESULTS coming from content.js on a search page. */
 async function handleResults(msg, sender) {
@@ -754,13 +749,7 @@ async function handleResults(msg, sender) {
 
   ss.items = dedupeItems([...(ss.items || []), ...(Array.isArray(msg.items) ? msg.items : [])]);
   ss.pagesDone = Math.max(ss.pagesDone || 0, ss.page || 1);
-  // DEBUG: Log maxPage received from content script
-  if (Number.isInteger(msg.maxPage)) {
-    ss.maxPage = msg.maxPage;
-    console.log(`[arb] [DEBUG] Amazon page ${ss.page}: received maxPage=${msg.maxPage} from content script`);
-  } else {
-    console.log(`[arb] [DEBUG] Amazon page ${ss.page}: NO maxPage from content script (msg.maxPage=${msg.maxPage})`);
-  }
+  if (Number.isInteger(msg.maxPage)) ss.maxPage = msg.maxPage;
   await commit();
   await continueAmazonPagination();
 }
@@ -782,8 +771,6 @@ async function finalizeRun() {
   const amz = cache.sites.amazon.items || [];
   const ebay = cache.sites.ebay.items || [];
   const ali = cache.sites.aliexpress.items || [];
-
-  console.log(`[arb] [DEBUG] Finalize: Amazon=${amz.length}, eBay=${ebay.length}, AliExpress=${ali.length}`);
 
   // Match eBay items with Amazon
   const matchedAmzEbay = computePairs(amz, ebay);
@@ -1436,9 +1423,6 @@ async function handleAnalyzeAmazonResults(msg, sender) {
     }
     return;
   }
-
-  // Log current collection progress for debugging
-  console.log(`[ARBScout] Progress: ${(st.items || []).length}/${ANALYZE_MAX_AMAZON_ITEMS} items collected, continuing to page ${msgPage + 1}/${pagesPer}`);
 
   // Candidate cap reached — no point crawling more pages.
   if ((st.items || []).length >= ANALYZE_MAX_AMAZON_ITEMS) {
@@ -2323,8 +2307,6 @@ async function handleAlarm(runId, site) {
   if (!ss || ss.status !== 'loading') return;
   await failStage(site, 'timeout');
 }
-
-
 
 /** If the user closes the results tab while we wait on it, don't hang. */
 chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
