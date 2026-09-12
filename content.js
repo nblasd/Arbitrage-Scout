@@ -1955,8 +1955,16 @@ function sleepPaced(ms, run) {
         log('eBay max page detected:', maxPage);
         log('[REPORT] Sending eBay results:', items.length, 'items, maxPage:', maxPage);
         report(run, { items, maxPage });
+      } else if (SITE === 'aliexpress') {
+        // AliExpress: detect and report maxPage for pagination
+        const aliexpressMax = aliexpressMaxPage();
+        log('[DEBUG] AliExpress page', window.location.href);
+        log('[DEBUG] AliExpress items found:', items.length);
+        log('[DEBUG] AliExpress maxPage detected:', aliexpressMax);
+        log('[REPORT] Sending AliExpress results:', items.length, 'items, maxPage:', aliexpressMax);
+        report(run, { items, maxPage: aliexpressMax });
       } else {
-        // DEBUG: Detect and report Amazon's maxPage so background knows when to stop
+        // Amazon
         const amazonMax = amazonMaxPage();
         log('[DEBUG] Amazon page', window.location.href);
         log('[DEBUG] Amazon items found:', items.length);

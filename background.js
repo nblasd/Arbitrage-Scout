@@ -564,6 +564,41 @@ async function continueAmazonPagination() {
   await finalizeRun();
 }
 
+async function continueAliExpressPagination() {
+  const ss = cache.sites.aliexpress;
+
+  // User-configured AliExpress page limit (same "Pages per site" input).
+  const userLimit = Number.isInteger(cache.pageLimit) && cache.pageLimit > 0
+    ? cache.pageLimit
+    : DEFAULT_PAGE_LIMIT;
+  const aliexpressMaxPages = Math.min(
+    AMAZON_ABSOLUTE_MAX_PAGES, // Use same hard cap as Amazon
+    userLimit
+  );
+  const nextPage = (ss.page || 1) + 1;
+
+  console.log(`[arb] AliExpress pagination: current=${ss.page}, maxPages=${aliexpressMaxPages}, detected=${Number.isInteger(ss.maxPage) ? ss.maxPage : 'n/a'}`);
+
+  // Reset retry flags on successful page
+  ss.priceParseRetried = false;
+  ss.noResultsRetried = false;
+
+  if (nextPage <= aliexpressMaxPages) {
+    // Add a random human-like delay between AliExpress page navigations
+    const delayMs = AMAZON_PAGE_DELAY_MIN_MS +
+      Math.floor(Math.random() * (AMAZON_PAGE_DELAY_MAX_MS - AMAZON_PAGE_DELAY_MIN_MS + 1));
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    await openSearchTab('aliexpress', { page: nextPage, resetItems: false });
+    return;
+  }
+
+  console.log(`[arb] Stopping AliExpress pagination at page ${ss.page}`);
+  ss.status = 'done';
+  await commit();
+  await retireSearchStageTab('aliexpress');
+  await finalizeRun();
+}
+
 /** React to a failed stage: record the reason and keep the run moving. */
 async function failStage(site, reason) {
   await ensureState();
@@ -632,6 +667,22 @@ async function handleResults(msg, sender) {
         return;
       }
     }
+    // AliExpress price-parse handling (same logic as Amazon)
+    if (reason === 'price-parse' && site === 'aliexpress') {
+      if ((ss.items || []).length > 0) {
+        console.log(`[arb] AliExpress price parse on page ${ss.page} but ${ss.items.length} items held — advancing pagination`);
+        await continueAliExpressPagination();
+        return;
+      }
+      if (!ss.priceParseRetried) {
+        ss.priceParseRetried = true;
+        console.log(`[arb] AliExpress price-parse with no candidates — retrying page ${ss.page || 1} once in the same tab`);
+        await new Promise((r) => setTimeout(r, AMAZON_PAGE_DELAY_MIN_MS +
+          Math.floor(Math.random() * (AMAZON_PAGE_DELAY_MAX_MS - AMAZON_PAGE_DELAY_MIN_MS + 1))));
+        await openSearchTab('aliexpress', { page: ss.page || 1, resetItems: false });
+        return;
+      }
+    }
     // A fast 'no-results' (redirect interstitial / empty grid) used to close
     // the stage tab immediately. Give it ONE paced same-page retry first —
     // late server-side redirects often resolve into the real search page.
@@ -642,6 +693,16 @@ async function handleResults(msg, sender) {
       await new Promise((r) => setTimeout(r, AMAZON_PAGE_DELAY_MIN_MS +
         Math.floor(Math.random() * (AMAZON_PAGE_DELAY_MAX_MS - AMAZON_PAGE_DELAY_MIN_MS + 1))));
       await openSearchTab('amazon', { page: ss.page || 1, resetItems: false });
+      return;
+    }
+    // AliExpress no-results handling (same logic as Amazon)
+    if (reason === 'no-results' && site === 'aliexpress' &&
+        (ss.items || []).length === 0 && !ss.noResultsRetried) {
+      ss.noResultsRetried = true;
+      console.log(`[arb] AliExpress page ${ss.page || 1} redirected/empty — paced retry in the same tab`);
+      await new Promise((r) => setTimeout(r, AMAZON_PAGE_DELAY_MIN_MS +
+        Math.floor(Math.random() * (AMAZON_PAGE_DELAY_MAX_MS - AMAZON_PAGE_DELAY_MIN_MS + 1))));
+      await openSearchTab('aliexpress', { page: ss.page || 1, resetItems: false });
       return;
     }
     // failStage closes the stage tab unless the block is recoverable
