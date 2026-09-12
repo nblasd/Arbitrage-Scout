@@ -579,8 +579,10 @@ async function failStage(site, reason) {
   if (reason !== 'blocked') await settleSearchStage(site);
   await commit();
 
-  if (site === 'ebay') await openSearchTab('amazon', { page: 1, resetItems: true });
-  else await finalizeRun();
+  if (site === 'ebay') {
+    await openSearchTab('amazon', { page: 1, resetItems: true });
+    await openSearchTab('aliexpress', { page: 1, resetItems: true });
+  } else await finalizeRun();
 }
 
 
@@ -589,7 +591,7 @@ async function handleResults(msg, sender) {
   await ensureState();
   if (cache.phase !== 'searching') return;
   const site = msg && msg.site;
-  if (site !== 'amazon' && site !== 'ebay') return;
+  if (site !== 'amazon' && site !== 'ebay' && site !== 'aliexpress') return;
 
   const ss = cache.sites[site];
   // Only accept results for the stage we are waiting on, from the tab we own,
@@ -659,6 +661,15 @@ async function handleResults(msg, sender) {
     if (Number.isInteger(msg.maxPage)) ss.maxPage = msg.maxPage;
     await commit();
     await continueEbayPagination();
+    return;
+  }
+
+  if (site === 'aliexpress') {
+    ss.items = dedupeItems([...(ss.items || []), ...(Array.isArray(msg.items) ? msg.items : [])]);
+    ss.pagesDone = Math.max(ss.pagesDone || 0, ss.page || 1);
+    if (Number.isInteger(msg.maxPage)) ss.maxPage = msg.maxPage;
+    await commit();
+    await continueAliExpressPagination();
     return;
   }
 
@@ -1871,7 +1882,7 @@ async function forceParse(sites) {
 /** Focus an existing results tab, or reopen it (search state preserved). */
 async function openResultsTab(site) {
   await ensureState();
-  if (site !== 'amazon' && site !== 'ebay') return;
+  if (site !== 'amazon' && site !== 'ebay' && site !== 'aliexpress') return;
   const ss = cache.sites[site];
   if (!ss) return;
 

@@ -97,14 +97,18 @@ const SITE = HOST === 'amazon.com' || HOST.endsWith('.amazon.com')
   ? 'amazon'
   : HOST === 'ebay.com' || HOST.endsWith('.ebay.com')
     ? 'ebay'
-    : null;
+    : HOST === 'aliexpress.com' || HOST.endsWith('.aliexpress.com')
+      ? 'aliexpress'
+      : null;
 
 // Not one of the supported marketplaces -> do nothing.
 if (!SITE) return;
 
 const isSearchPath =
   SITE === 'amazon' ? /^\/(s|gp\/search)(\/|$)/.test(location.pathname)
-                    : /^\/sch(\/|$)/.test(location.pathname);
+  : SITE === 'ebay' ? /^\/sch(\/|$)/.test(location.pathname)
+  : SITE === 'aliexpress' ? /^\/wholesale/.test(location.pathname)
+  : false;
 
 // Phase 3 (manual-match flow): Amazon single-product pages (/dp/<ASIN>,
 // /gp/product/<ASIN>) are valid parse targets. The popup's "paste a verified
@@ -119,7 +123,9 @@ const isProductPath =
     try {
       const p = new URLSearchParams(location.search);
       return SITE === 'amazon' ? (p.get('k') || '').trim()
-                               : (p.get('_nkw') || '').trim();
+             : SITE === 'ebay' ? (p.get('_nkw') || '').trim()
+             : SITE === 'aliexpress' ? (p.get('SearchText') || '').trim()
+             : '';
     } catch (_) { return ''; }
   }
   const QUERY = readQueryFromUrl();
