@@ -400,7 +400,8 @@ async function openSearchTab(site, opts) {
   opts = opts || {};
   const ss = cache.sites[site];
   const page = Math.max(1, Number(opts.page || ss.page || 1));
-  const query = cache.query;
+  // Use the query passed in opts if available, otherwise fall back to cache.query
+  const query = opts.query !== undefined ? opts.query : cache.query;
   let url;
   if (site === 'ebay') url = SEARCH_URLS.ebay(query, page);
   else if (site === 'amazon') url = SEARCH_URLS.amazon(query, page);

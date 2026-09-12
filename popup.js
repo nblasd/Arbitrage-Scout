@@ -58,6 +58,7 @@ const els = {
   analyzeElapsed: $('analyzeElapsed'),
   chipStepEbay: $('chipStepEbay'),
   chipStepAmazon: $('chipStepAmazon'),
+  chipStepAliexpress: $('chipStepAliexpress'),
   chipStepProfit: $('chipStepProfit'),
   analyzeRetry: $('btnAnalyzeRetry'),
   analyzeCancel: $('btnAnalyzeCancel'),
