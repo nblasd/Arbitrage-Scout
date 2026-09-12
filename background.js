@@ -1045,6 +1045,28 @@ async function navigateAnalyzeAmazonTab(query, page) {
   console.log(`[ARBScout] Amazon tab opened (page ${page}/${pagesPer}):`, tab.id, { query: String(query).slice(0, 60), pagesPer });
 }
 
+async function navigateAnalyzeAliExpressTab(query, page) {
+  const st = analyzeCache.stages.aliexpress;
+  const url = self.ARBScout.buildAliExpressSearchUrl(query, page);
+  let tab = null;
+  try { tab = await chrome.tabs.get(st.tabId); } catch (_) { tab = null; }
+  if (!tab) {
+    tab = await chrome.tabs.create({ url, active: false });
+  } else {
+    tab = await chrome.tabs.update(tab.id, { url, active: false });
+  }
+  st.tabId = tab.id;
+  st.url = tab.url || url;
+  st.status = 'loading';
+  st.error = null;
+  st.page = page;
+  try { await registerScrapeTab(tab.id); await updateTabSweepAlarm(); } catch (_) { /* cleanup.js missing */ }
+  setItemWatch('aliexpress');
+  const pagesPer = analyzeAmazonPagesPerSite(); // Use same setting
+  await commitAnalyze();
+  console.log(`[ARBScout] AliExpress tab opened (page ${page}/${pagesPer}):`, tab.id, { query: String(query).slice(0, 60), pagesPer });
+}
+
 async function failAnalyzeStage(stage, reason) {
   await ensureAnalyzeState();
   if (!analyzeCache) return;

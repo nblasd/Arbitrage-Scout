@@ -1,1 +1,1 @@
-Nothing needs to be added to .gitignore since only a JavaScript source file (`background.js`) was modified and no build artifacts, dependencies, or temporary files were detected in the changes.
+Nothing needs to be added to the .gitignore file since only JavaScript source files (background.js, ebay2amazon.js) were modified and no build artifacts, dependencies, or temporary files were detected in the changes.
