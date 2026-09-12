@@ -1294,14 +1294,14 @@ async function analyzeBuildQueryAndSearch() {
   // Initialize AliExpress stage as well
   const aliSt = analyzeCache.stages.aliexpress;
   if (aliSt) {
-    aliSt.query = q.query;
+    aliSt.query = exactTitleQuery(item.title); // Use the exact title query for AliExpress
     aliSt.page = 1;
     aliSt.pagesDone = 0;
     aliSt.items = [];
     aliSt.priceParseRetried = false;
     aliSt.noResultsRetried = false;
     aliSt.pagesPerSite = analyzeAmazonPagesPerSite(); // Use same setting
-    console.log(`[ARBScout] AliExpress stage init: pagesPerSite=${aliSt.pagesPerSite}`);
+    console.log(`[ARBScout] AliExpress stage init: pagesPerSite=${aliSt.pagesPerSite}, query="${aliSt.query}"`);
   }
   
   analyzeCache.phase = 'searching-amazon';
